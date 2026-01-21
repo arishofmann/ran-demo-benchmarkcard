@@ -77,6 +77,10 @@ class BenchmarkDetails(BaseModel):
         ...,
         description="URLs to official papers, datasets, leaderboards, and documentation",
     )
+    provenance: Optional[Dict[str, Dict[str, str]]] = Field(
+        default=None,
+        description="Source evidence mapping: field_name -> {source, evidence}",
+    )
 
 
 class PurposeAndIntendedUsers(BaseModel):
@@ -110,6 +114,10 @@ class PurposeAndIntendedUsers(BaseModel):
         ...,
         description="Explicit examples of inappropriate or unsupported use cases for this benchmark",
     )
+    provenance: Optional[Dict[str, Dict[str, str]]] = Field(
+        default=None,
+        description="Source evidence mapping: field_name -> {source, evidence}",
+    )
 
 
 class DataInfo(BaseModel):
@@ -137,6 +145,10 @@ class DataInfo(BaseModel):
     annotation: str = Field(
         ...,
         description="Annotation methodology, quality control measures, inter-annotator agreement, and any human involvement in labeling",
+    )
+    provenance: Optional[Dict[str, Dict[str, str]]] = Field(
+        default=None,
+        description="Source evidence mapping: field_name -> {source, evidence}",
     )
 
 
@@ -176,6 +188,10 @@ class Methodology(BaseModel):
         ...,
         description="Quality assurance measures, validation procedures, and steps taken to ensure reliable and reproducible evaluations",
     )
+    provenance: Optional[Dict[str, Dict[str, str]]] = Field(
+        default=None,
+        description="Source evidence mapping: field_name -> {source, evidence}",
+    )
 
 
 class EthicalAndLegalConsiderations(BaseModel):
@@ -204,6 +220,10 @@ class EthicalAndLegalConsiderations(BaseModel):
         ...,
         description="Adherence to relevant regulations (GDPR, IRB approval, etc.) and ethical review processes",
     )
+    provenance: Optional[Dict[str, Dict[str, str]]] = Field(
+        default=None,
+        description="Source evidence mapping: field_name -> {source, evidence}",
+    )
 
 
 class BenchmarkCard(BaseModel):
@@ -222,6 +242,21 @@ class BenchmarkCard(BaseModel):
     data: DataInfo
     methodology: Methodology
     ethical_and_legal_considerations: EthicalAndLegalConsiderations
+
+
+def extract_provenance(section_data: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Extract provenance from section data, returning clean data and provenance separately.
+
+    Args:
+        section_data: Section dictionary that may contain a 'provenance' field.
+
+    Returns:
+        Tuple of (clean_section_data without provenance, provenance_data).
+    """
+    # Make a copy to avoid mutating the original
+    clean_data = dict(section_data)
+    provenance = clean_data.pop("provenance", None) or {}
+    return clean_data, provenance
 
 
 @tool("compose_benchmark_card")
@@ -326,6 +361,7 @@ def compose_benchmark_card(
     }
 
     generated_sections = {}
+    all_provenance = {}  # Track provenance for all sections
 
     for section_name, section_class in sections:
         logger.debug("Generating %s", section_name.replace("_", " ").title())
@@ -491,6 +527,22 @@ FIELD-SPECIFIC RULES (use "Not specified" if not found in sources):
 - data.size: Use EXACT numbers from sources (e.g., "1.24 GB" from HuggingFace, "10K examples" from paper). Do NOT approximate or invent numbers.
 - data.format: Use format from HuggingFace tags (e.g., "parquet") or paper. Otherwise write "Not specified"
 
+PROVENANCE TRACKING (REQUIRED):
+For EVERY field you fill in (except "Not specified" values), you MUST add an entry to the "provenance" field.
+The provenance field maps each field name to its source and evidence:
+{{{{
+  "provenance": {{{{
+    "field_name": {{{{
+      "source": "paper|huggingface|unitxt|extracted_ids",
+      "evidence": "exact quote or description from the source"
+    }}}}
+  }}}}
+}}}}
+Example: If you set size to "1.24 GB" from HuggingFace, include:
+  "provenance": {{{{"size": {{{{"source": "huggingface", "evidence": "Total amount of disk used: 1.24 GB"}}}}}}}}
+- Include the EXACT text snippet that supports your value
+- Omit fields set to "Not specified" from provenance
+
 {example_text}""",
                 ),
                 (
@@ -561,9 +613,15 @@ Generate {section_name} section using ONLY the metadata above.""",
                     }
                 )
 
-                generated_sections[section_name] = section_result.model_dump()
+                # Extract provenance from section data
+                section_dict = section_result.model_dump()
+                clean_section, section_provenance = extract_provenance(section_dict)
+                generated_sections[section_name] = clean_section
+                if section_provenance:
+                    all_provenance[section_name] = section_provenance
+
                 logger.debug("%s completed", section_name.replace("_", " ").title())
-                logger.debug("Preview: %s", str(section_result.model_dump())[:100] + "...")
+                logger.debug("Preview: %s", str(clean_section)[:100] + "...")
                 break  # Success, exit retry loop
 
             except Exception as e:
@@ -611,8 +669,16 @@ Generate {section_name} section using ONLY the metadata above.""",
         raise
 
     # add metadata about the composition process
+    # Exclude provenance from benchmark_card output (it's saved separately)
+    benchmark_card_dict = final_card.model_dump(exclude_none=True)
+    # Double-check: remove any remaining provenance fields from nested sections
+    for section_key in benchmark_card_dict:
+        if isinstance(benchmark_card_dict[section_key], dict) and "provenance" in benchmark_card_dict[section_key]:
+            del benchmark_card_dict[section_key]["provenance"]
+
     return {
-        "benchmark_card": final_card.model_dump(),
+        "benchmark_card": benchmark_card_dict,
+        "provenance": all_provenance if all_provenance else None,
         "composition_metadata": {
             "sources_used": {
                 "unitxt": bool(unitxt_metadata),
