@@ -29,20 +29,33 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 from pydantic import BaseModel, Field
 
-from pathlib import Path
-
 # use the shared llm instance
 from auto_benchmarkcard.config import LLM, Config
 
 logger = logging.getLogger(__name__)
 
-# Load gold example for few-shot prompting
-_GOLD_EXAMPLE_PATH = Path(__file__).parent / "gold_example.json"
-_GOLD_EXAMPLE: Dict[str, Any] = {}
-try:
-    _GOLD_EXAMPLE = json.loads(_GOLD_EXAMPLE_PATH.read_text(encoding="utf-8"))
-except Exception:
-    logger.warning("Could not load gold example from %s", _GOLD_EXAMPLE_PATH)
+
+def _compact_hf_metadata(hf_metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract only the fields useful for composition from HF metadata."""
+    meta = hf_metadata
+    if "tags" not in meta:
+        for v in meta.values():
+            if isinstance(v, dict) and "tags" in v:
+                meta = v
+                break
+
+    compact: Dict[str, Any] = {}
+    for key in ("id", "tags", "license", "downloads", "likes"):
+        if key in meta:
+            compact[key] = meta[key]
+
+    if "card_data" in meta and meta["card_data"]:
+        compact["card_data"] = meta["card_data"]
+
+    if "readme_markdown" in meta and meta["readme_markdown"]:
+        compact["readme_excerpt"] = meta["readme_markdown"][:1500]
+
+    return compact
 
 
 # schema for the benchmark card
@@ -59,13 +72,34 @@ class BenchmarkDetails(BaseModel):
         resources: URLs to official papers, datasets, leaderboards, and documentation.
     """
 
-    name: str = Field(..., description="Official benchmark name")
-    overview: str = Field(..., description="What the benchmark measures and why it matters")
-    data_type: str = Field(..., description="Data modality (e.g., text, image, audio, tabular)")
-    domains: List[str] = Field(..., description="Application domains (e.g., 'medical', 'news', 'Wikipedia')")
-    languages: List[str] = Field(..., description="Languages using full names (e.g., 'English')")
-    similar_benchmarks: List[str] = Field(..., description="Names of related benchmarks (e.g., 'SuperGLUE', 'SQuAD')")
-    resources: List[str] = Field(..., description="URLs only (e.g., 'https://gluebenchmark.com/')")
+    name: str = Field(
+        ...,
+        description="The official name of the benchmark as it appears in literature",
+    )
+    overview: str = Field(
+        ...,
+        description="A comprehensive 2-3 sentence description explaining what the benchmark measures, its key characteristics, and its significance in the field",
+    )
+    data_type: str = Field(
+        ...,
+        description="The primary data modality (e.g., text, image, audio, multimodal, tabular)",
+    )
+    domains: List[str] = Field(
+        ...,
+        description="Specific application domains or subject areas (e.g., medical, legal, scientific, conversational AI)",
+    )
+    languages: List[str] = Field(
+        ...,
+        description="All languages supported in the dataset using full language names (e.g., 'English', 'Chinese', 'Spanish', 'Multilingual')",
+    )
+    similar_benchmarks: List[str] = Field(
+        ...,
+        description="Names of closely related or comparable benchmarks that measure similar capabilities",
+    )
+    resources: List[str] = Field(
+        ...,
+        description="URLs to official papers, datasets, leaderboards, and documentation",
+    )
     provenance: Optional[Dict[str, Dict[str, str]]] = Field(
         default=None,
         description="Source evidence mapping: field_name -> {source, evidence}",
@@ -83,11 +117,26 @@ class PurposeAndIntendedUsers(BaseModel):
         out_of_scope_uses: Explicit examples of inappropriate or unsupported use cases.
     """
 
-    goal: str = Field(..., description="Primary objective of the benchmark")
-    audience: List[str] = Field(..., description="Target user groups (e.g., 'NLP researchers', 'model developers')")
-    tasks: List[str] = Field(..., description="Evaluation tasks (e.g., 'question answering', 'sentiment analysis')")
-    limitations: str = Field(..., description="Known limitations or constraints")
-    out_of_scope_uses: List[str] = Field(..., description="Inappropriate or unsupported use cases")
+    goal: str = Field(
+        ...,
+        description="The primary objective and research question this benchmark addresses, including what capabilities or behaviors it aims to measure",
+    )
+    audience: List[str] = Field(
+        ...,
+        description="Target user groups (e.g., 'AI researchers', 'model developers', 'safety evaluators', 'industry practitioners')",
+    )
+    tasks: List[str] = Field(
+        ...,
+        description="Specific evaluation tasks or subtasks the benchmark covers (e.g., 'question answering', 'code generation', 'factual accuracy')",
+    )
+    limitations: str = Field(
+        ...,
+        description="Known limitations, biases, or constraints of the benchmark that users should be aware of",
+    )
+    out_of_scope_uses: List[str] = Field(
+        ...,
+        description="Explicit examples of inappropriate or unsupported use cases for this benchmark",
+    )
     provenance: Optional[Dict[str, Dict[str, str]]] = Field(
         default=None,
         description="Source evidence mapping: field_name -> {source, evidence}",
@@ -104,29 +153,25 @@ class DataInfo(BaseModel):
         annotation: Annotation methodology and quality control measures.
     """
 
-<<<<<<< Updated upstream
     source: str = Field(
         ...,
         description="Detailed information about data origins, collection methods, and any preprocessing steps applied",
     )
     size: str = Field(
         ...,
-        description="Dataset size with specific numbers (e.g., '10,000 examples', '50K questions across 3 splits')",
+        description="Dataset size. Prefer number of examples from paper (e.g., '817 questions'). "
+        "If only disk size from HuggingFace is available, use that (e.g., '1.24 GB')",
     )
     format: str = Field(
         ...,
-        description="Data structure, file formats, and organization (e.g., 'JSON with question-answer pairs', 'CSV with multiple choice options')",
+        description="The data format as described in the paper or README "
+        "(e.g., 'JSON with question-answer pairs'). If only the HuggingFace hosting "
+        "format is known, note it as such (e.g., 'parquet (HuggingFace hosting format)')",
     )
     annotation: str = Field(
         ...,
         description="Annotation methodology, quality control measures, inter-annotator agreement, and any human involvement in labeling",
     )
-=======
-    source: str = Field(..., description="Where and how the data was collected or assembled")
-    size: str = Field(..., description="Dataset size (e.g., '10K examples' or '1.24 GB')")
-    format: str = Field(..., description="Data format (e.g., 'JSON', 'parquet', 'CSV')")
-    annotation: str = Field(..., description="How the data was annotated and by whom")
->>>>>>> Stashed changes
     provenance: Optional[Dict[str, Dict[str, str]]] = Field(
         default=None,
         description="Source evidence mapping: field_name -> {source, evidence}",
@@ -145,12 +190,30 @@ class Methodology(BaseModel):
         validation: Quality assurance measures and validation procedures.
     """
 
-    methods: List[str] = Field(..., description="Evaluation methods used (e.g., 'zero-shot evaluation', 'fine-tuning')")
-    metrics: List[str] = Field(..., description="Metric names (e.g., 'accuracy', 'F1', 'BLEU')")
-    calculation: str = Field(..., description="How metrics are computed or aggregated")
-    interpretation: str = Field(..., description="How to interpret the scores")
-    baseline_results: str = Field(..., description="Key baseline performance numbers")
-    validation: str = Field(..., description="How evaluation reliability was ensured")
+    methods: List[str] = Field(
+        ...,
+        description="Evaluation approaches and techniques applied within the benchmark (e.g., 'zero-shot evaluation', 'few-shot prompting', 'fine-tuning')",
+    )
+    metrics: List[str] = Field(
+        ...,
+        description="Specific quantitative metrics used (e.g., 'accuracy', 'F1-score', 'BLEU', 'exact match')",
+    )
+    calculation: str = Field(
+        ...,
+        description="Detailed explanation of how metrics are computed, including any normalization or aggregation methods",
+    )
+    interpretation: str = Field(
+        ...,
+        description="Guidelines for interpreting scores, including score ranges, what constitutes good performance, and any caveats",
+    )
+    baseline_results: str = Field(
+        ...,
+        description="Performance of established models or baselines, with specific numbers and context for comparison",
+    )
+    validation: str = Field(
+        ...,
+        description="Quality assurance measures, validation procedures, and steps taken to ensure reliable and reproducible evaluations",
+    )
     provenance: Optional[Dict[str, Dict[str, str]]] = Field(
         default=None,
         description="Source evidence mapping: field_name -> {source, evidence}",
@@ -167,10 +230,22 @@ class EthicalAndLegalConsiderations(BaseModel):
         compliance_with_regulations: Adherence to relevant regulations and ethical reviews.
     """
 
-    privacy_and_anonymity: str = Field(..., description="Data protection and anonymization measures")
-    data_licensing: str = Field(..., description="License terms and usage restrictions")
-    consent_procedures: str = Field(..., description="Informed consent processes")
-    compliance_with_regulations: str = Field(..., description="Regulatory compliance (GDPR, IRB, etc.)")
+    privacy_and_anonymity: str = Field(
+        ...,
+        description="Data protection measures, anonymization techniques, and handling of personally identifiable information",
+    )
+    data_licensing: str = Field(
+        ...,
+        description="Specific license terms, usage restrictions, and redistribution permissions",
+    )
+    consent_procedures: str = Field(
+        ...,
+        description="Details of informed consent processes, participant rights, and withdrawal procedures",
+    )
+    compliance_with_regulations: str = Field(
+        ...,
+        description="Adherence to relevant regulations (GDPR, IRB approval, etc.) and ethical review processes",
+    )
     provenance: Optional[Dict[str, Dict[str, str]]] = Field(
         default=None,
         description="Source evidence mapping: field_name -> {source, evidence}",
@@ -311,8 +386,44 @@ def compose_benchmark_card(
         "ethical_and_legal_considerations": "ethics privacy licensing consent compliance regulations",
     }
 
+    has_paper = bool(docling_output and docling_output.get("success"))
+    has_hf = bool(hf_metadata)
+    has_unitxt = bool(unitxt_metadata)
+
+    # Build source priority text dynamically based on available sources
+    if has_paper:
+        source_priority_text = """SOURCE PRIORITY (varies by field type):
+
+CONCEPTUAL FIELDS (Paper is primary source):
+- overview, goal, audience, tasks, limitations, out_of_scope_uses,
+  methods, calculation, interpretation, baseline_results, validation,
+  similar_benchmarks, annotation
+→ Priority: Paper > HuggingFace > UnitXT
+
+OPERATIONAL/METADATA FIELDS (HuggingFace is primary source):
+- size, format, languages, data_licensing, resources
+→ Priority: HuggingFace > Paper > UnitXT
+
+STRUCTURAL FIELDS (UnitXT is primary source):
+- metrics, domains, data_type
+→ Priority: UnitXT tags > Paper > HuggingFace
+
+WHEN SOURCES CONFLICT:
+- Use the value from the PRIMARY source for that field type
+- Note the conflict in provenance (see CONFLICT HANDLING below)
+- Do NOT average or merge conflicting values"""
+    else:
+        source_priority_text = """SOURCE PRIORITY (no academic paper available):
+1. HuggingFace README and metadata (PRIMARY - treat as authoritative description)
+2. UnitXT metadata (catalog and task metadata)
+3. Extracted IDs (for URLs and identifiers)
+
+NOTE: No academic paper was found for this benchmark.
+Rely on HuggingFace README as the main descriptive source.
+For structural/task fields, prefer UnitXT metadata."""
+
     generated_sections = {}
-    all_provenance = {}  # Track provenance for all sections
+    all_provenance = {}
 
     for section_name, section_class in sections:
         logger.debug("Generating %s", section_name.replace("_", " ").title())
@@ -326,179 +437,51 @@ def compose_benchmark_card(
 
                 if relevant_chunks:
                     formatted_chunks = []
+                    char_budget = 1500
+                    chars_used = 0
                     for i, chunk in enumerate(relevant_chunks, 1):
-                        formatted_chunks.append(f"[Relevant Paper Section {i}]\n{chunk.page_content}")
+                        text = chunk.page_content
+                        if chars_used + len(text) > char_budget:
+                            remaining = char_budget - chars_used
+                            if remaining > 100:
+                                formatted_chunks.append(f"[Paper Section {i}]\n{text[:remaining]}")
+                            break
+                        formatted_chunks.append(f"[Paper Section {i}]\n{text}")
+                        chars_used += len(text)
                     paper_content = "\n\n".join(formatted_chunks)
                     logger.debug(f"Retrieved {len(relevant_chunks)} paper chunks for {section_name}")
                 else:
                     logger.debug(f"No relevant chunks found for {section_name}, using fallback")
-                    # Fallback: use first 2000 chars if retrieval fails
                     if docling_output and docling_output.get("filtered_text"):
-                        paper_content = docling_output.get("filtered_text", "")[:2000]
+                        paper_content = docling_output.get("filtered_text", "")[:1500]
             except Exception as e:
                 logger.warning(f"Paper retrieval failed for {section_name}: {e}")
-                # Fallback: use first 2000 chars
                 if docling_output and docling_output.get("filtered_text"):
-                    paper_content = docling_output.get("filtered_text", "")[:2000]
+                    paper_content = docling_output.get("filtered_text", "")[:1500]
         elif docling_output and docling_output.get("success"):
-            # No retriever available, use first 2000 chars as fallback
-            paper_content = docling_output.get("filtered_text", "Not available")[:2000]
+            paper_content = docling_output.get("filtered_text", "Not available")[:1500]
 
-<<<<<<< Updated upstream
-        # Define few-shot examples for each section
-        # NOTE: Placeholders like [BENCHMARK_1] are used to prevent the LLM from copying example values
-        few_shot_examples = {
-            "benchmark_details": {
-                "good_example": {
-                    "name": "[BENCHMARK_NAME] - use actual name from sources",
-                    "overview": "A comprehensive description extracted from the paper abstract or introduction, explaining what the benchmark evaluates and its key characteristics.",
-                    "data_type": "text",
-                    "domains": [
-                        "[DOMAIN_1] - extract from paper",
-                        "[DOMAIN_2] - extract from paper",
-                    ],
-                    "languages": ["[LANGUAGE] - extract from sources"],
-                    "similar_benchmarks": ["[BENCHMARK_1] - ONLY if explicitly mentioned in paper", "[BENCHMARK_2] - otherwise use 'Not specified'"],
-                    "resources": [
-                        "[URL_1] - use actual URLs from sources",
-                        "[URL_2] - use actual URLs from sources",
-                    ],
-                },
-                "bad_example": {
-                    "name": "prompt_leakage.glue",
-                    "overview": "natural language understanding",
-                    "data_type": "text",
-                    "domains": ["NLP"],
-                    "languages": ["en"],
-                    "similar_benchmarks": ["D1", "D2"],
-                    "resources": ["paper", "dataset"],
-                },
-            },
-            "purpose_and_intended_users": {
-                "good_example": {
-                    "goal": "Extract the stated purpose/goal from the paper's introduction or abstract. Describe what the benchmark aims to evaluate or achieve.",
-                    "audience": [
-                        "[AUDIENCE_1] - extract from paper if mentioned",
-                        "[AUDIENCE_2] - otherwise use generic ML/NLP audience",
-                    ],
-                    "tasks": [
-                        "[TASK_1] - list actual tasks from sources",
-                        "[TASK_2] - list actual tasks from sources",
-                    ],
-                    "limitations": "Extract limitations explicitly stated in the paper. If none stated, write 'Not specified'",
-                    "out_of_scope_uses": [
-                        "[USE_1] - extract from paper if mentioned",
-                        "Otherwise write 'Not specified'",
-                    ],
-                }
-            },
-            "data": {
-                "good_example": {
-                    "source": "Describe data sources as stated in the paper or HuggingFace metadata",
-                    "size": "[NUMBER] examples - USE EXACT COUNT FROM SOURCES (e.g., '1.24 GB' from HuggingFace, or 'Not specified' if not found)",
-                    "format": "[FORMAT] - extract from HuggingFace (e.g., 'parquet') or paper, otherwise 'Not specified'",
-                    "annotation": "Describe annotation process from paper. If not described, write 'Not specified'",
-                },
-                "bad_example": {
-                    "source": "various sources",
-                    "size": "large dataset",
-                    "format": "text",
-                    "annotation": "manual annotation",
-                },
-            },
-            "methodology": {
-                "good_example": {
-                    "methods": [
-                        "[METHOD_1] - extract evaluation methods from paper",
-                        "[METHOD_2] - extract evaluation methods from paper",
-                    ],
-                    "metrics": [
-                        "[METRIC_1] - list metrics explicitly mentioned in sources",
-                        "[METRIC_2] - list metrics explicitly mentioned in sources",
-                    ],
-                    "calculation": "Describe how metrics are calculated IF explicitly stated in paper. Otherwise write 'Not specified'",
-                    "interpretation": "Describe score interpretation IF stated in paper. Write 'Not specified' if human baseline not mentioned.",
-                    "baseline_results": "[MODEL] achieves [SCORE]% - ONLY include if EXACT numbers appear in paper. Otherwise write 'Not specified'",
-                    "validation": "Describe validation approach from paper. If not described, write 'Not specified'",
-                }
-            },
-        }
-
-        section_example = few_shot_examples.get(section_name, {})
-        example_text = ""
-        if section_example:
-            if "good_example" in section_example:
-                good_json = (
-                    json.dumps(section_example["good_example"], indent=2)
-                    .replace("{", "{{")
-                    .replace("}", "}}")
-                )
-                example_text += f"\n\nGOOD EXAMPLE:\n{good_json}"
-            if "bad_example" in section_example:
-                bad_json = (
-                    json.dumps(section_example["bad_example"], indent=2)
-                    .replace("{", "{{")
-                    .replace("}", "}}")
-                )
-                example_text += f"\n\nBAD EXAMPLE (avoid this):\n{bad_json}"
-
-        # set up section-specific prompt with enhanced instructions and priority order
+        # set up section-specific prompt
         section_prompt = ChatPromptTemplate.from_messages(
             [
                 (
                     "system",
-                    f"""You are an AI evaluation researcher. Generate a {section_class.__name__} object for the '{section_name}' section.
+                    f"""You are documenting an AI benchmark. Generate the '{section_name}' section.
 
-CRITICAL RULES:
-1. Use ONLY information from the provided metadata sources
-2. If information is missing, write exactly: "Not specified"
-3. Do NOT use your training data or make assumptions
-4. Be concise and specific
-5. Return only valid JSON
-=======
-        # Build gold example text for this section (escape braces for LangChain)
-        gold_section = _GOLD_EXAMPLE.get(section_name, {})
-        gold_text = ""
-        if gold_section:
-            gold_text = json.dumps(gold_section, indent=2).replace("{", "{{").replace("}", "}}")
+RULES:
+1. Use ONLY the provided metadata sources. If information is not found, write exactly "Not specified".
+2. Write in third person. Describe the benchmark objectively ("The benchmark evaluates..." not "We evaluate..."). When a source uses "we/our", rephrase into third-person descriptive language.
+3. Do not invent facts, URLs, numbers, or performance scores. Only include what the sources explicitly state.
 
-        # set up section-specific prompt
-        messages = [
-            (
-                "system",
-                f"""You are documenting an AI benchmark. Generate the '{section_name}' section.
+{source_priority_text}
 
-Use ONLY the provided sources. If information is not found, write "Not specified".
-Write in third person. Do not invent facts.
->>>>>>> Stashed changes
-
-SOURCE PRIORITY (use in this order):
-1. Paper Content (HIGHEST PRIORITY - most authoritative source)
-2. HuggingFace metadata (official dataset information)
-3. UnitXT metadata (catalog metadata)
-4. Extracted IDs (for URLs and identifiers)
-
-<<<<<<< Updated upstream
-FORBIDDEN:
-- Generic examples (e.g., "BERT-large achieves 80.5%") unless explicitly in sources
-- Placeholder names (e.g., "D1", "D2") unless in metadata
-- Invented metrics or performance numbers
-- Fake URLs or resources
-- Rambling or repetitive text
-- Copying values from the examples below - they are templates only
-
-FIELD-SPECIFIC RULES (use "Not specified" if not found in sources):
-- methodology.baseline_results: ONLY include specific model scores if EXACT numbers appear in paper/sources. Otherwise write "Not specified"
-- methodology.interpretation: ONLY include human baseline percentage if paper explicitly states it. Otherwise write "Not specified"
-- methodology.calculation: ONLY describe if paper explains how metrics are computed. Otherwise write "Not specified"
-- methodology.validation: ONLY describe if paper explains validation approach. Otherwise write "Not specified"
-- benchmark_details.similar_benchmarks: ONLY list benchmarks explicitly mentioned/compared in the paper. Otherwise write "Not specified"
-- data.size: Use EXACT numbers from sources (e.g., "1.24 GB" from HuggingFace, "10K examples" from paper). Do NOT approximate or invent numbers.
-- data.format: Use format from HuggingFace tags (e.g., "parquet") or paper. Otherwise write "Not specified"
+AMBIGUOUS FIELDS:
+- data.size: Prefer example counts from the paper (e.g., "817 questions"). If unavailable, use HuggingFace disk size (e.g., "1.24 GB"). Do not conflate the two.
+- data.format: Prefer the format described in the paper or README. If only the HuggingFace hosting format is known, note it (e.g., "parquet (HuggingFace hosting format)").
+- benchmark_details.languages: Use full names (e.g., "English" not "en").
 
 PROVENANCE TRACKING (REQUIRED):
-For EVERY field you fill in (except "Not specified" values), you MUST add an entry to the "provenance" field.
-The provenance field maps each field name to its source and evidence:
+For every field you fill in (except "Not specified"), include a provenance entry mapping the field name to its source and a supporting quote:
 {{{{
   "provenance": {{{{
     "field_name": {{{{
@@ -507,37 +490,24 @@ The provenance field maps each field name to its source and evidence:
     }}}}
   }}}}
 }}}}
-Example: If you set size to "1.24 GB" from HuggingFace, include:
-  "provenance": {{{{"size": {{{{"source": "huggingface", "evidence": "Total amount of disk used: 1.24 GB"}}}}}}}}
-- Include the EXACT text snippet that supports your value
-- Omit fields set to "Not specified" from provenance
-
-{example_text}""",
+If sources conflict, use the primary source for that field type and add a "conflict" key:
+{{{{
+  "provenance": {{{{
+    "field_name": {{{{
+      "source": "huggingface",
+      "evidence": "Total amount of disk used: 1.24 GB",
+      "conflict": "Paper states 10K examples but no disk size"
+    }}}}
+  }}}}
+}}}}""",
                 ),
                 (
                     "user",
-                    f"""Query: {{query}}
-=======
-PROVENANCE: For every filled field, add a provenance entry:
-{{{{"field_name": {{{{"source": "paper|huggingface|unitxt|extracted_ids", "evidence": "short quote"}}}}}}}}""",
-            ),
-        ]
+                    f"""Benchmark: {{query}}
 
-        if gold_text:
-            messages.append((
-                "user",
-                f"Here is an example of a well-formatted '{section_name}' section for a different benchmark (SQuAD 2.0). Match this style and level of detail:\n\n{gold_text}",
-            ))
+METADATA SOURCES:
 
-        messages.append((
-            "user",
-            f"""Now generate the '{section_name}' section for the following benchmark.
-
-Benchmark: {{query}}
->>>>>>> Stashed changes
-
-METADATA SOURCES (in priority order):
-1. PAPER CONTENT (highest priority - use this first):
+1. PAPER CONTENT:
 {{paper_content}}
 
 2. HuggingFace Dataset:
@@ -547,23 +517,12 @@ METADATA SOURCES (in priority order):
 {{unitxt_metadata}}
 
 4. Extracted IDs:
-{{extracted_ids}}""",
-        ))
+{{extracted_ids}}
 
-<<<<<<< Updated upstream
-INSTRUCTIONS:
-- Extract information from sources in priority order (1 → 4)
-- Paper content is the most authoritative source - use it first
-- Only use HuggingFace/UnitXT if information is NOT found in paper
-- If a field cannot be found in ANY source, use "Not specified"
-
-Generate {section_name} section using ONLY the metadata above.""",
+Generate the {section_name} section using ONLY the sources above.""",
                 ),
             ]
         )
-=======
-        section_prompt = ChatPromptTemplate.from_messages(messages)
->>>>>>> Stashed changes
 
         # configure for structured output
         llm_with_structure = LLM.with_structured_output(section_class)
@@ -579,18 +538,10 @@ Generate {section_name} section using ONLY the metadata above.""",
                 hf_formatted = "Not available"
                 if hf_metadata:
                     if isinstance(hf_metadata, dict):
-                        # Extract most relevant parts from HF metadata
-                        hf_parts = []
-                        if "card_data" in hf_metadata and hf_metadata["card_data"]:
-                            hf_parts.append(f"Card Data:\n{json.dumps(hf_metadata['card_data'], indent=2)}")
-                        if "dataset_info" in hf_metadata and hf_metadata["dataset_info"]:
-                            hf_parts.append(f"Dataset Info:\n{json.dumps(hf_metadata['dataset_info'], indent=2)}")
-                        if hf_parts:
-                            hf_formatted = "\n\n".join(hf_parts)
-                        else:
-                            hf_formatted = json.dumps(hf_metadata, indent=2)
+                        hf_compact = _compact_hf_metadata(hf_metadata)
+                        hf_formatted = json.dumps(hf_compact, indent=2) if hf_compact else "Not available"
                     else:
-                        hf_formatted = str(hf_metadata)
+                        hf_formatted = str(hf_metadata)[:2000]
 
                 unitxt_formatted = json.dumps(unitxt_metadata, indent=2) if unitxt_metadata else "Not available"
                 extracted_formatted = json.dumps(extracted_ids, indent=2) if extracted_ids else "Not available"

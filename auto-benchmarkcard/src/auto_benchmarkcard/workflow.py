@@ -338,14 +338,14 @@ def extract_missing_fields(data: Any, prefix: str = "") -> List[str]:
     return missing_fields
 
 
+# ---------------------------------------------------------------------------
+# Post-processing helpers
+# ---------------------------------------------------------------------------
+
 def _backfill_from_provenance(
     card: Dict[str, Any], provenance: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Fill 'Not specified' fields using provenance evidence when available.
-
-    If the LLM recorded provenance evidence for a field but still wrote
-    'Not specified' in the card, use the evidence text as the field value.
-    """
+    """Fill 'Not specified' fields using provenance evidence when available."""
     for section_key, section_val in card.items():
         if not isinstance(section_val, dict):
             continue
@@ -370,12 +370,7 @@ def _backfill_from_provenance(
 
 
 def _normalize_not_specified(card: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize inconsistent 'Not specified' representations.
-
-    Converts empty lists, empty strings, None, and single-element
-    ["Not specified"] lists into a consistent format.
-    """
-    # Fields that are expected to be lists in the schema
+    """Normalize inconsistent 'Not specified' representations."""
     list_fields = {
         "domains", "languages", "similar_benchmarks", "resources",
         "audience", "tasks", "out_of_scope_uses", "methods", "metrics",
@@ -392,11 +387,9 @@ def _normalize_not_specified(card: Dict[str, Any]) -> Dict[str, Any]:
 
             if field_val is None or field_val == "" or field_val == []:
                 card[section_key][field_key] = ["Not specified"] if is_list_field else "Not specified"
-            elif isinstance(field_val, list) and len(field_val) == 1 and field_val[0] == "Not specified":
-                pass  # already correct
             elif isinstance(field_val, list) and all(
-                item == "Not specified" for item in field_val if isinstance(item, str)
-            ) and len(field_val) > 0 and all(isinstance(item, str) for item in field_val):
+                isinstance(item, str) and item == "Not specified" for item in field_val
+            ):
                 card[section_key][field_key] = ["Not specified"]
 
     return card
@@ -460,17 +453,13 @@ _SIZE_CATEGORY_MAP = {
 def _extract_hf_tags(hf_metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Extract deterministic field values from HuggingFace dataset tags.
 
-    Parses structured tags (language:xx, format:xx, etc.) into human-readable
-    values that can override LLM-generated content.
-
     Returns a flat dict keyed by dotted field paths, e.g.:
-        {"benchmark_details.languages": ["English"], "data.format": "parquet", ...}
+        {"benchmark_details.languages": ["English"], "data.format": "parquet"}
     Only includes keys where a value was actually found.
     """
     if not hf_metadata:
         return {}
 
-    # Handle nested dict (multi-repo result keyed by repo ID)
     tags = hf_metadata.get("tags")
     if tags is None:
         for v in hf_metadata.values():
@@ -498,11 +487,8 @@ def _extract_hf_tags(hf_metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             continue
 
         if prefix == "language":
-            lang_name = _LANG_CODE_MAP.get(value)
-            if lang_name:
-                languages.append(lang_name)
-            else:
-                languages.append(value)
+            lang_name = _LANG_CODE_MAP.get(value, value)
+            languages.append(lang_name)
 
         elif prefix == "modality":
             modalities.append(value.capitalize())
@@ -519,9 +505,7 @@ def _extract_hf_tags(hf_metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             size = _SIZE_CATEGORY_MAP.get(value, value)
 
         elif prefix == "license":
-            if value == "other" or value == "unknown":
-                license_val = None
-            else:
+            if value not in ("other", "unknown"):
                 license_val = _LICENSE_MAP.get(value, value)
 
     if languages:
@@ -546,7 +530,7 @@ def _apply_deterministic_overrides(
     """Apply deterministic HF-extracted values to the benchmark card.
 
     HF tags are factual metadata; they always take precedence over
-    LLM-generated content for the six target fields.
+    LLM-generated content for the target fields.
     """
     for dotted_key, override_val in overrides.items():
         section, _, field = dotted_key.partition(".")
@@ -556,7 +540,7 @@ def _apply_deterministic_overrides(
         old = card[section].get(field)
         card[section][field] = override_val
         if old != override_val:
-            logger.debug("HF override %s: %r → %r", dotted_key, old, override_val)
+            logger.debug("HF override %s: %r -> %r", dotted_key, old, override_val)
 
     return card
 
@@ -1049,15 +1033,18 @@ def run_rag(state: GraphState) -> Dict[str, Any]:
         documents = indexer.create_documents(unitxt_data, hf_data, state["query"], docling_data)
         # Documents created count removed
 
-        # Initialize enhanced RAG retriever
+        # Initialize enhanced RAG retriever with lightweight model for reranking/reformulation
+        from auto_benchmarkcard.config import get_light_llm_handler
+
         try:
+            light_llm = get_light_llm_handler()
             retriever = RAGRetriever(
                 embedding_model=Config.DEFAULT_EMBEDDING_MODEL,
                 enable_llm_reranking=Config.ENABLE_LLM_RERANKING,
                 enable_hybrid_search=Config.ENABLE_HYBRID_SEARCH,
                 enable_query_expansion=Config.ENABLE_QUERY_EXPANSION,
+                llm_handler=light_llm,
             )
-            # RAG retriever ready message removed
         except Exception as e:
             logger.warning(f"Enhanced retriever failed: {e}")
             logger.info("Using basic retriever fallback")
@@ -1076,9 +1063,12 @@ def run_rag(state: GraphState) -> Dict[str, Any]:
         if "benchmark_card" in benchmark_card:
             benchmark_card = benchmark_card["benchmark_card"]
 
-        # Break card into atomic statements
-        # Atomizing message removed
-        statements = atomize_benchmark_card(benchmark_card, "all")
+        # Break card into atomic statements (lightweight model suffices)
+        statements = atomize_benchmark_card(
+            benchmark_card, "all",
+            engine_type=Config.LLM_ENGINE_TYPE,
+            model_name=Config.LIGHT_MODEL,
+        )
         # Statements extracted count removed
 
         # Extract statement texts for batch processing
@@ -1172,10 +1162,10 @@ def run_factreasoner(state: GraphState):
 
         # Evaluation progress message removed
 
-        # Run factuality evaluation
+        # Run factuality evaluation (uses its own FactReasoner-library LLM config)
         factuality_results = evaluate_factuality(
             formatted_rag_results=rag_results,
-            model=Config.DEFAULT_MODEL,
+            model=Config.FACTREASONER_MODEL,
             cache_dir=Config.FACTREASONER_CACHE_DIR,
             merlin_path=str(Config.MERLIN_BIN),
             debug_mode=False,
@@ -1192,14 +1182,19 @@ def run_factreasoner(state: GraphState):
         risk_card_src = state.get("risk_enhanced_card") or state.get("composed_card") or {}
         clean_card = extract_card(risk_card_src)
 
+        # Extract provenance from composed card to allow provenance-aware flagging
+        composed_card_data = state.get("composed_card", {})
+        provenance_data = composed_card_data.get("provenance") if isinstance(composed_card_data, dict) else None
+
         field_analysis = factuality_results.get("field_analysis", {})
         flagged_card = flag_benchmark_card_fields(
             benchmark_card=clean_card,
             field_analysis=field_analysis,
             threshold=Config.DEFAULT_FACTUALITY_THRESHOLD,
+            provenance=provenance_data,
         )
 
-        # Backfill: if a field says "Not specified" but provenance has evidence, use the evidence
+        # Backfill: if a field says "Not specified" but provenance has evidence, use it
         if provenance_data:
             flagged_card = _backfill_from_provenance(flagged_card, provenance_data)
 
@@ -1217,8 +1212,7 @@ def run_factreasoner(state: GraphState):
             if "flagged_fields" in flagged_card and isinstance(flagged_card["flagged_fields"], dict):
                 for dotted_key in hf_overrides:
                     flag_key = dotted_key.split(".")[-1]
-                    full_key = dotted_key
-                    for k in (flag_key, full_key):
+                    for k in (flag_key, dotted_key):
                         if k in flagged_card["flagged_fields"]:
                             del flagged_card["flagged_fields"][k]
                             logger.debug("Cleared stale flag for %s (deterministic override)", k)
@@ -1226,7 +1220,7 @@ def run_factreasoner(state: GraphState):
         # Add missing_fields section
         flagged_card["missing_fields"] = extract_missing_fields(flagged_card)
 
-        # Add card_info section at the bottom
+        # Add card_info section
         from datetime import datetime
 
         flagged_card["card_info"] = {
@@ -1482,6 +1476,8 @@ def main() -> None:
                         args.enable_llm_reranking, args.enable_hybrid_search, args.enable_query_expansion,
                         args.parent_chunk_size, args.child_chunk_size, args.factuality_threshold, args.top_k)
 
+        logger.info("Models — composer: %s | light: %s | factreasoner: %s",
+                    Config.COMPOSER_MODEL, Config.LIGHT_MODEL, Config.FACTREASONER_MODEL)
         logger.debug("Starting metadata extraction for: '%s'", args.query)
         if args.catalog:
             logger.debug("Using custom catalog: %s", args.catalog)
