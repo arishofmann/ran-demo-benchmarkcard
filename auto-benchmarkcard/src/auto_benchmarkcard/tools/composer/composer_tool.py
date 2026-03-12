@@ -29,10 +29,20 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 from pydantic import BaseModel, Field
 
+from pathlib import Path
+
 # use the shared llm instance
 from auto_benchmarkcard.config import LLM, Config
 
 logger = logging.getLogger(__name__)
+
+# Load gold example for few-shot prompting
+_GOLD_EXAMPLE_PATH = Path(__file__).parent / "gold_example.json"
+_GOLD_EXAMPLE: Dict[str, Any] = {}
+try:
+    _GOLD_EXAMPLE = json.loads(_GOLD_EXAMPLE_PATH.read_text(encoding="utf-8"))
+except Exception:
+    logger.warning("Could not load gold example from %s", _GOLD_EXAMPLE_PATH)
 
 
 # schema for the benchmark card
@@ -49,34 +59,13 @@ class BenchmarkDetails(BaseModel):
         resources: URLs to official papers, datasets, leaderboards, and documentation.
     """
 
-    name: str = Field(
-        ...,
-        description="The official name of the benchmark as it appears in literature",
-    )
-    overview: str = Field(
-        ...,
-        description="A comprehensive 2-3 sentence description explaining what the benchmark measures, its key characteristics, and its significance in the field",
-    )
-    data_type: str = Field(
-        ...,
-        description="The primary data modality (e.g., text, image, audio, multimodal, tabular)",
-    )
-    domains: List[str] = Field(
-        ...,
-        description="Specific application domains or subject areas (e.g., medical, legal, scientific, conversational AI)",
-    )
-    languages: List[str] = Field(
-        ...,
-        description="All languages supported in the dataset using full language names (e.g., 'English', 'Chinese', 'Spanish', 'Multilingual')",
-    )
-    similar_benchmarks: List[str] = Field(
-        ...,
-        description="Names of closely related or comparable benchmarks that measure similar capabilities",
-    )
-    resources: List[str] = Field(
-        ...,
-        description="URLs to official papers, datasets, leaderboards, and documentation",
-    )
+    name: str = Field(..., description="Official benchmark name")
+    overview: str = Field(..., description="What the benchmark measures and why it matters")
+    data_type: str = Field(..., description="Data modality (e.g., text, image, audio, tabular)")
+    domains: List[str] = Field(..., description="Application domains (e.g., 'medical', 'news', 'Wikipedia')")
+    languages: List[str] = Field(..., description="Languages using full names (e.g., 'English')")
+    similar_benchmarks: List[str] = Field(..., description="Names of related benchmarks (e.g., 'SuperGLUE', 'SQuAD')")
+    resources: List[str] = Field(..., description="URLs only (e.g., 'https://gluebenchmark.com/')")
     provenance: Optional[Dict[str, Dict[str, str]]] = Field(
         default=None,
         description="Source evidence mapping: field_name -> {source, evidence}",
@@ -94,26 +83,11 @@ class PurposeAndIntendedUsers(BaseModel):
         out_of_scope_uses: Explicit examples of inappropriate or unsupported use cases.
     """
 
-    goal: str = Field(
-        ...,
-        description="The primary objective and research question this benchmark addresses, including what capabilities or behaviors it aims to measure",
-    )
-    audience: List[str] = Field(
-        ...,
-        description="Target user groups (e.g., 'AI researchers', 'model developers', 'safety evaluators', 'industry practitioners')",
-    )
-    tasks: List[str] = Field(
-        ...,
-        description="Specific evaluation tasks or subtasks the benchmark covers (e.g., 'question answering', 'code generation', 'factual accuracy')",
-    )
-    limitations: str = Field(
-        ...,
-        description="Known limitations, biases, or constraints of the benchmark that users should be aware of",
-    )
-    out_of_scope_uses: List[str] = Field(
-        ...,
-        description="Explicit examples of inappropriate or unsupported use cases for this benchmark",
-    )
+    goal: str = Field(..., description="Primary objective of the benchmark")
+    audience: List[str] = Field(..., description="Target user groups (e.g., 'NLP researchers', 'model developers')")
+    tasks: List[str] = Field(..., description="Evaluation tasks (e.g., 'question answering', 'sentiment analysis')")
+    limitations: str = Field(..., description="Known limitations or constraints")
+    out_of_scope_uses: List[str] = Field(..., description="Inappropriate or unsupported use cases")
     provenance: Optional[Dict[str, Dict[str, str]]] = Field(
         default=None,
         description="Source evidence mapping: field_name -> {source, evidence}",
@@ -130,6 +104,7 @@ class DataInfo(BaseModel):
         annotation: Annotation methodology and quality control measures.
     """
 
+<<<<<<< Updated upstream
     source: str = Field(
         ...,
         description="Detailed information about data origins, collection methods, and any preprocessing steps applied",
@@ -146,6 +121,12 @@ class DataInfo(BaseModel):
         ...,
         description="Annotation methodology, quality control measures, inter-annotator agreement, and any human involvement in labeling",
     )
+=======
+    source: str = Field(..., description="Where and how the data was collected or assembled")
+    size: str = Field(..., description="Dataset size (e.g., '10K examples' or '1.24 GB')")
+    format: str = Field(..., description="Data format (e.g., 'JSON', 'parquet', 'CSV')")
+    annotation: str = Field(..., description="How the data was annotated and by whom")
+>>>>>>> Stashed changes
     provenance: Optional[Dict[str, Dict[str, str]]] = Field(
         default=None,
         description="Source evidence mapping: field_name -> {source, evidence}",
@@ -164,30 +145,12 @@ class Methodology(BaseModel):
         validation: Quality assurance measures and validation procedures.
     """
 
-    methods: List[str] = Field(
-        ...,
-        description="Evaluation approaches and techniques applied within the benchmark (e.g., 'zero-shot evaluation', 'few-shot prompting', 'fine-tuning')",
-    )
-    metrics: List[str] = Field(
-        ...,
-        description="Specific quantitative metrics used (e.g., 'accuracy', 'F1-score', 'BLEU', 'exact match')",
-    )
-    calculation: str = Field(
-        ...,
-        description="Detailed explanation of how metrics are computed, including any normalization or aggregation methods",
-    )
-    interpretation: str = Field(
-        ...,
-        description="Guidelines for interpreting scores, including score ranges, what constitutes good performance, and any caveats",
-    )
-    baseline_results: str = Field(
-        ...,
-        description="Performance of established models or baselines, with specific numbers and context for comparison",
-    )
-    validation: str = Field(
-        ...,
-        description="Quality assurance measures, validation procedures, and steps taken to ensure reliable and reproducible evaluations",
-    )
+    methods: List[str] = Field(..., description="Evaluation methods used (e.g., 'zero-shot evaluation', 'fine-tuning')")
+    metrics: List[str] = Field(..., description="Metric names (e.g., 'accuracy', 'F1', 'BLEU')")
+    calculation: str = Field(..., description="How metrics are computed or aggregated")
+    interpretation: str = Field(..., description="How to interpret the scores")
+    baseline_results: str = Field(..., description="Key baseline performance numbers")
+    validation: str = Field(..., description="How evaluation reliability was ensured")
     provenance: Optional[Dict[str, Dict[str, str]]] = Field(
         default=None,
         description="Source evidence mapping: field_name -> {source, evidence}",
@@ -204,22 +167,10 @@ class EthicalAndLegalConsiderations(BaseModel):
         compliance_with_regulations: Adherence to relevant regulations and ethical reviews.
     """
 
-    privacy_and_anonymity: str = Field(
-        ...,
-        description="Data protection measures, anonymization techniques, and handling of personally identifiable information",
-    )
-    data_licensing: str = Field(
-        ...,
-        description="Specific license terms, usage restrictions, and redistribution permissions",
-    )
-    consent_procedures: str = Field(
-        ...,
-        description="Details of informed consent processes, participant rights, and withdrawal procedures",
-    )
-    compliance_with_regulations: str = Field(
-        ...,
-        description="Adherence to relevant regulations (GDPR, IRB approval, etc.) and ethical review processes",
-    )
+    privacy_and_anonymity: str = Field(..., description="Data protection and anonymization measures")
+    data_licensing: str = Field(..., description="License terms and usage restrictions")
+    consent_procedures: str = Field(..., description="Informed consent processes")
+    compliance_with_regulations: str = Field(..., description="Regulatory compliance (GDPR, IRB, etc.)")
     provenance: Optional[Dict[str, Dict[str, str]]] = Field(
         default=None,
         description="Source evidence mapping: field_name -> {source, evidence}",
@@ -393,6 +344,7 @@ def compose_benchmark_card(
             # No retriever available, use first 2000 chars as fallback
             paper_content = docling_output.get("filtered_text", "Not available")[:2000]
 
+<<<<<<< Updated upstream
         # Define few-shot examples for each section
         # NOTE: Placeholders like [BENCHMARK_1] are used to prevent the LLM from copying example values
         few_shot_examples = {
@@ -503,6 +455,22 @@ CRITICAL RULES:
 3. Do NOT use your training data or make assumptions
 4. Be concise and specific
 5. Return only valid JSON
+=======
+        # Build gold example text for this section (escape braces for LangChain)
+        gold_section = _GOLD_EXAMPLE.get(section_name, {})
+        gold_text = ""
+        if gold_section:
+            gold_text = json.dumps(gold_section, indent=2).replace("{", "{{").replace("}", "}}")
+
+        # set up section-specific prompt
+        messages = [
+            (
+                "system",
+                f"""You are documenting an AI benchmark. Generate the '{section_name}' section.
+
+Use ONLY the provided sources. If information is not found, write "Not specified".
+Write in third person. Do not invent facts.
+>>>>>>> Stashed changes
 
 SOURCE PRIORITY (use in this order):
 1. Paper Content (HIGHEST PRIORITY - most authoritative source)
@@ -510,6 +478,7 @@ SOURCE PRIORITY (use in this order):
 3. UnitXT metadata (catalog metadata)
 4. Extracted IDs (for URLs and identifiers)
 
+<<<<<<< Updated upstream
 FORBIDDEN:
 - Generic examples (e.g., "BERT-large achieves 80.5%") unless explicitly in sources
 - Placeholder names (e.g., "D1", "D2") unless in metadata
@@ -548,6 +517,24 @@ Example: If you set size to "1.24 GB" from HuggingFace, include:
                 (
                     "user",
                     f"""Query: {{query}}
+=======
+PROVENANCE: For every filled field, add a provenance entry:
+{{{{"field_name": {{{{"source": "paper|huggingface|unitxt|extracted_ids", "evidence": "short quote"}}}}}}}}""",
+            ),
+        ]
+
+        if gold_text:
+            messages.append((
+                "user",
+                f"Here is an example of a well-formatted '{section_name}' section for a different benchmark (SQuAD 2.0). Match this style and level of detail:\n\n{gold_text}",
+            ))
+
+        messages.append((
+            "user",
+            f"""Now generate the '{section_name}' section for the following benchmark.
+
+Benchmark: {{query}}
+>>>>>>> Stashed changes
 
 METADATA SOURCES (in priority order):
 1. PAPER CONTENT (highest priority - use this first):
@@ -560,8 +547,10 @@ METADATA SOURCES (in priority order):
 {{unitxt_metadata}}
 
 4. Extracted IDs:
-{{extracted_ids}}
+{{extracted_ids}}""",
+        ))
 
+<<<<<<< Updated upstream
 INSTRUCTIONS:
 - Extract information from sources in priority order (1 → 4)
 - Paper content is the most authoritative source - use it first
@@ -572,6 +561,9 @@ Generate {section_name} section using ONLY the metadata above.""",
                 ),
             ]
         )
+=======
+        section_prompt = ChatPromptTemplate.from_messages(messages)
+>>>>>>> Stashed changes
 
         # configure for structured output
         llm_with_structure = LLM.with_structured_output(section_class)
