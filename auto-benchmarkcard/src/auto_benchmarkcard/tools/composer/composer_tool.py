@@ -127,6 +127,7 @@ def extract_section_facts(
     unitxt_metadata: Optional[Dict[str, Any]],
     extracted_ids: Optional[Dict[str, Any]] = None,
     query: str = "",
+    eee_metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Use the light model to extract key facts for a section before composition.
 
@@ -137,6 +138,7 @@ def extract_section_facts(
         unitxt_metadata: UnitXT catalog metadata dict.
         extracted_ids: Optional extracted identifiers.
         query: Benchmark name.
+        eee_metadata: Optional EEE evaluation metadata (metrics, scores, etc.).
 
     Returns:
         Extracted facts as a formatted string of bullet points per field.
@@ -152,16 +154,32 @@ def extract_section_facts(
         hf_compact = _compact_hf_metadata(hf_metadata) if isinstance(hf_metadata, dict) else {}
         hf_text = json.dumps(hf_compact, indent=2) if hf_compact else "Not available"
 
-    unitxt_text = json.dumps(unitxt_metadata, indent=2) if unitxt_metadata else "Not available"
     ids_text = json.dumps(extracted_ids, indent=2) if extracted_ids else "Not available"
+
+    # Build sources list dynamically — only include available sources
+    source_parts = [f"1. PAPER CONTENT:\n{paper_content}"]
+    source_parts.append(f"2. HuggingFace Dataset:\n{hf_text}")
+
+    source_idx = 3
+    if unitxt_metadata:
+        unitxt_text = json.dumps(unitxt_metadata, indent=2)
+        source_parts.append(f"{source_idx}. UnitXT Catalog:\n{unitxt_text}")
+        source_idx += 1
+
+    source_parts.append(f"{source_idx}. Extracted IDs:\n{ids_text}")
+    source_idx += 1
+
+    if eee_metadata:
+        eee_compact = _compact_eee_metadata(eee_metadata)
+        eee_text = json.dumps(eee_compact, indent=2) if eee_compact else "Not available"
+        source_parts.append(f"{source_idx}. Every Eval Ever (EEE) Evaluation Data:\n{eee_text}")
+
+    sources = "\n\n".join(source_parts)
 
     user_message = (
         f"Benchmark: {query}\n\n"
         f"SOURCES:\n\n"
-        f"1. PAPER CONTENT:\n{paper_content}\n\n"
-        f"2. HuggingFace Dataset:\n{hf_text}\n\n"
-        f"3. UnitXT Catalog:\n{unitxt_text}\n\n"
-        f"4. Extracted IDs:\n{ids_text}\n\n"
+        f"{sources}\n\n"
         f"---\n\n"
         f"{extraction_prompt}\n"
         f"Return facts as short bullet points per field. Only include what the sources explicitly state."
@@ -198,6 +216,42 @@ def _compact_hf_metadata(hf_metadata: Dict[str, Any]) -> Dict[str, Any]:
 
     if "readme_markdown" in meta and meta["readme_markdown"]:
         compact["readme_excerpt"] = meta["readme_markdown"][:1500]
+
+    return compact
+
+
+def _compact_eee_metadata(eee_metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract only the fields useful for composition from EEE metadata."""
+    compact: Dict[str, Any] = {}
+
+    if eee_metadata.get("benchmark_name"):
+        compact["benchmark_name"] = eee_metadata["benchmark_name"]
+    if eee_metadata.get("eval_library"):
+        compact["eval_library"] = eee_metadata["eval_library"]
+    if eee_metadata.get("source_urls"):
+        compact["source_urls"] = eee_metadata["source_urls"][:5]
+
+    # Include metrics info
+    metrics = eee_metadata.get("metrics", {})
+    if metrics:
+        compact["metrics"] = {
+            k: {
+                "description": v.get("evaluation_description", ""),
+                "lower_is_better": v.get("lower_is_better", False),
+                "score_type": v.get("score_type", ""),
+            }
+            for k, v in list(metrics.items())[:10]
+        }
+
+    # Include evaluation summary (top performers, stats)
+    eval_summary = eee_metadata.get("evaluation_summary", {})
+    if eval_summary:
+        compact["evaluation_summary"] = {
+            "total_models": eval_summary.get("total_models_evaluated", 0),
+            "primary_metric": eval_summary.get("primary_metric", ""),
+            "score_statistics": eval_summary.get("score_statistics", {}),
+            "top_performers": eval_summary.get("top_performers", [])[:5],
+        }
 
     return compact
 
@@ -431,20 +485,22 @@ def extract_provenance(section_data: Dict[str, Any]) -> tuple[Dict[str, Any], Di
 
 @tool("compose_benchmark_card")
 def compose_benchmark_card(
-    unitxt_metadata: Dict[str, Any],
+    unitxt_metadata: Optional[Dict[str, Any]] = None,
     hf_metadata: Optional[Dict[str, Any]] = None,
     extracted_ids: Optional[Dict[str, Any]] = None,
     docling_output: Optional[Dict[str, Any]] = None,
     query: str = "",
+    eee_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Compose a benchmark card from all the metadata we collected.
 
     Args:
-        unitxt_metadata: Metadata from UnitXT catalog.
+        unitxt_metadata: Optional metadata from UnitXT catalog.
         hf_metadata: Optional metadata from HuggingFace.
         extracted_ids: Optional extracted identifier information.
         docling_output: Optional extracted paper content.
         query: Original query string for context.
+        eee_metadata: Optional metadata from Every Eval Ever (EEE).
 
     Returns:
         Dictionary containing composed benchmark card and composition metadata.
@@ -462,6 +518,8 @@ def compose_benchmark_card(
         data_sources.append("Extracted IDs")
     if docling_output and docling_output.get("success"):
         data_sources.append("Academic Paper")
+    if eee_metadata:
+        data_sources.append("EEE")
 
     logger.debug(f"Available data sources: {', '.join(data_sources)}")
 
@@ -615,6 +673,7 @@ def compose_benchmark_card(
             unitxt_metadata=unitxt_metadata,
             extracted_ids=extracted_ids,
             query=query,
+            eee_metadata=eee_metadata,
         )
 
         # ── Step 2: COMPOSE — heavy model formats facts into schema ──
@@ -707,52 +766,72 @@ Generate the {section_name} section by formatting these facts into the required 
                 else:
                     hf_formatted = str(hf_metadata)[:2000]
 
-            unitxt_formatted = json.dumps(unitxt_metadata, indent=2) if unitxt_metadata else "Not available"
             extracted_formatted = json.dumps(extracted_ids, indent=2) if extracted_ids else "Not available"
+
+            # Build fallback sources and invoke variables dynamically
+            fallback_invoke_vars = {
+                "query": query,
+                "paper_content": paper_content,
+                "hf_metadata": hf_formatted,
+                "extracted_ids": extracted_formatted,
+            }
+
+            # Build numbered source list for the prompt
+            fb_sources = [
+                "1. PAPER CONTENT:\n{paper_content}",
+                "2. HuggingFace Dataset:\n{hf_metadata}",
+            ]
+            fb_idx = 3
+            if unitxt_metadata:
+                unitxt_formatted = json.dumps(unitxt_metadata, indent=2)
+                fb_sources.append(f"{fb_idx}. UnitXT Catalog:\n" + "{unitxt_metadata}")
+                fallback_invoke_vars["unitxt_metadata"] = unitxt_formatted
+                fb_idx += 1
+            fb_sources.append(f"{fb_idx}. Extracted IDs:\n" + "{extracted_ids}")
+            fb_idx += 1
+            if eee_metadata:
+                eee_compact = _compact_eee_metadata(eee_metadata)
+                eee_formatted = json.dumps(eee_compact, indent=2)
+                fb_sources.append(f"{fb_idx}. Every Eval Ever (EEE) Evaluation Data:\n" + "{eee_metadata}")
+                fallback_invoke_vars["eee_metadata"] = eee_formatted
+
+            fallback_sources_block = "\n\n".join(fb_sources)
+
+            # Determine valid source names for provenance
+            source_names = "paper|huggingface|extracted_ids"
+            if unitxt_metadata:
+                source_names += "|unitxt"
+            if eee_metadata:
+                source_names += "|eee"
 
             section_prompt = ChatPromptTemplate.from_messages(
                 [
                     (
                         "system",
-                        f"""You are documenting an AI benchmark. Generate the '{section_name}' section.
-
-RULES:
-1. Use ONLY the provided metadata sources. If information is not found, write exactly "Not specified".
-2. Write in third person. Describe the benchmark objectively.
-3. Do not invent facts, URLs, numbers, or performance scores. Only include what the sources explicitly state.
-4. Be concise. Match the style and length of the gold example.
-{gold_snippet}
-
-PROVENANCE TRACKING (REQUIRED):
-For every field you fill in (except "Not specified"), include a provenance entry:
-{{{{
-  "provenance": {{{{
-    "field_name": {{{{
-      "source": "paper|huggingface|unitxt|extracted_ids",
-      "evidence": "exact quote or description from the source"
-    }}}}
-  }}}}
-}}}}""",
+                        "You are documenting an AI benchmark. Generate the '" + section_name + "' section.\n\n"
+                        "RULES:\n"
+                        "1. Use ONLY the provided metadata sources. If information is not found, write exactly \"Not specified\".\n"
+                        "2. Write in third person. Describe the benchmark objectively.\n"
+                        "3. Do not invent facts, URLs, numbers, or performance scores. Only include what the sources explicitly state.\n"
+                        "4. Be concise. Match the style and length of the gold example.\n"
+                        + gold_snippet + "\n\n"
+                        "PROVENANCE TRACKING (REQUIRED):\n"
+                        "For every field you fill in (except \"Not specified\"), include a provenance entry:\n"
+                        "{{\n"
+                        '  "provenance": {{\n'
+                        '    "field_name": {{\n'
+                        '      "source": "' + source_names + '",\n'
+                        '      "evidence": "exact quote or description from the source"\n'
+                        "    }}\n"
+                        "  }}\n"
+                        "}}",
                     ),
                     (
                         "user",
-                        f"""Benchmark: {{query}}
-
-METADATA SOURCES:
-
-1. PAPER CONTENT:
-{{paper_content}}
-
-2. HuggingFace Dataset:
-{{hf_metadata}}
-
-3. UnitXT Catalog:
-{{unitxt_metadata}}
-
-4. Extracted IDs:
-{{extracted_ids}}
-
-Generate the {section_name} section using ONLY the sources above.""",
+                        "Benchmark: {query}\n\n"
+                        "METADATA SOURCES:\n\n"
+                        + fallback_sources_block + "\n\n"
+                        "Generate the " + section_name + " section using ONLY the sources above.",
                     ),
                 ]
             )
@@ -762,15 +841,7 @@ Generate the {section_name} section using ONLY the sources above.""",
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    section_result = chain.invoke(
-                        {
-                            "query": query,
-                            "paper_content": paper_content,
-                            "hf_metadata": hf_formatted,
-                            "unitxt_metadata": unitxt_formatted,
-                            "extracted_ids": extracted_formatted,
-                        }
-                    )
+                    section_result = chain.invoke(fallback_invoke_vars)
                     section_dict = section_result.model_dump()
                     clean_section, section_provenance = extract_provenance(section_dict)
                     generated_sections[section_name] = clean_section
@@ -805,7 +876,6 @@ Generate the {section_name} section using ONLY the sources above.""",
 
     except Exception as e:
         logger.error("Failed to assemble final benchmark card: %s", e)
-        logger.error("Failed to assemble final card: %s", e)
         raise
 
     # add metadata about the composition process
@@ -825,6 +895,7 @@ Generate the {section_name} section using ONLY the sources above.""",
                 "huggingface": bool(hf_metadata),
                 "extracted_ids": bool(extracted_ids),
                 "docling": bool(docling_output),
+                "eee": bool(eee_metadata),
             },
             "query": query,
             "composition_timestamp": datetime.now().isoformat(),

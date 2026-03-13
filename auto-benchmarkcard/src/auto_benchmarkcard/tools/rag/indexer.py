@@ -6,7 +6,7 @@ with clean text extraction to avoid JSON syntax confusion.
 
 import json
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
@@ -69,16 +69,16 @@ class MetadataIndexer:
 
     def create_documents(
         self,
-        unitxt_data: Dict[str, Any],
-        hf_data: Dict[str, Any],
+        unitxt_data: Optional[Dict[str, Any]],
+        hf_data: Optional[Dict[str, Any]],
         benchmark_name: str,
-        docling_data: Dict[str, Any] = None,
+        docling_data: Optional[Dict[str, Any]] = None,
     ) -> List[Document]:
         """Create searchable documents from all metadata sources.
 
         Args:
-            unitxt_data: Metadata from UnitXT catalog.
-            hf_data: Metadata from HuggingFace.
+            unitxt_data: Optional metadata from UnitXT catalog.
+            hf_data: Optional metadata from HuggingFace.
             benchmark_name: Name of the benchmark.
             docling_data: Optional extracted paper content.
 
@@ -87,8 +87,10 @@ class MetadataIndexer:
         """
         docs = []
 
-        docs.extend(self._process_unitxt(unitxt_data, benchmark_name))
-        docs.extend(self._process_huggingface(hf_data, benchmark_name))
+        if unitxt_data:
+            docs.extend(self._process_unitxt(unitxt_data, benchmark_name))
+        if hf_data:
+            docs.extend(self._process_huggingface(hf_data, benchmark_name))
 
         if docling_data:
             docs.extend(self._process_docling(docling_data, benchmark_name))

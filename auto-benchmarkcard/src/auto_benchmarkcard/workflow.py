@@ -586,6 +586,7 @@ class GraphState(TypedDict):
     rag_results: Optional[Dict[str, Any]]
     factuality_results: Optional[Dict[str, Any]]
     final_card: Optional[Dict[str, Any]]
+    eee_metadata: Optional[Dict[str, Any]]
 
 
 def orchestrator(state: GraphState) -> Dict[str, str]:
@@ -597,10 +598,13 @@ def orchestrator(state: GraphState) -> Dict[str, str]:
     Returns:
         Dictionary with 'next' key indicating the next worker to run.
     """
-    if state["unitxt_json"] is None:
-        return {"next": "unitxt_worker"}
-    if state["extracted_ids"] is None:
-        return {"next": "extractor_worker"}
+    # EEE path: skip UnitXT and extractor when EEE metadata is present
+    is_eee = state.get("eee_metadata") is not None
+    if not is_eee:
+        if state["unitxt_json"] is None:
+            return {"next": "unitxt_worker"}
+        if state["extracted_ids"] is None:
+            return {"next": "extractor_worker"}
 
     # HuggingFace lookup if we have repo ID
     if state["hf_repo"] is not None and state["hf_json"] is None:
@@ -719,18 +723,25 @@ def run_hf_extractor(state: GraphState):
         current_extracted = state.get("extracted_ids", {})
 
         # Try to extract paper_url from HF metadata
-        # HF JSON contains multiple datasets, need to check each one
         hf_data = state["hf_json"]
         paper_url = None
 
-        for dataset_id, dataset_metadata in hf_data.items():
-            if isinstance(dataset_metadata, dict):
-                hf_extracted = extract_ids.func(source=dataset_metadata, want=["paper_url"])
-                extracted_paper_url = hf_extracted.get("paper_url")
-                if extracted_paper_url:
-                    paper_url = extracted_paper_url
-                    logger.info("Found paper_url in HF dataset %s: %s", dataset_id, paper_url)
-                    break
+        # First try extracting from the top-level HF JSON (tags are at top level)
+        hf_extracted = extract_ids.func(source=hf_data, want=["paper_url"])
+        paper_url = hf_extracted.get("paper_url")
+        if paper_url:
+            logger.info("Found paper_url in HF top-level metadata: %s", paper_url)
+
+        # Fallback: check nested dataset dicts (e.g. card_data, builder_metadata values)
+        if not paper_url:
+            for dataset_id, dataset_metadata in hf_data.items():
+                if isinstance(dataset_metadata, dict):
+                    hf_extracted = extract_ids.func(source=dataset_metadata, want=["paper_url"])
+                    extracted_paper_url = hf_extracted.get("paper_url")
+                    if extracted_paper_url:
+                        paper_url = extracted_paper_url
+                        logger.info("Found paper_url in HF dataset %s: %s", dataset_id, paper_url)
+                        break
 
         if paper_url:
             # Merge the paper_url into existing extracted_ids
@@ -894,12 +905,16 @@ def run_composer(state: GraphState):
         if state.get("catalog_path") and "." in state["query"]:
             query_for_composer = state["query"].split(".")[-1]
 
+        # In EEE mode, don't pass unitxt_metadata (it's None)
+        unitxt_for_composer = state.get("unitxt_json") if not state.get("eee_metadata") else None
+
         result = compose_benchmark_card.func(
-            unitxt_metadata=state.get("unitxt_json", {}),
+            unitxt_metadata=unitxt_for_composer,
             hf_metadata=state.get("hf_json"),
             extracted_ids=state.get("extracted_ids", {}),
             docling_output=state.get("docling_output"),
             query=query_for_composer,
+            eee_metadata=state.get("eee_metadata"),
         )
 
         logger.info("Successfully composed benchmark card")
@@ -1022,16 +1037,13 @@ def run_rag(state: GraphState) -> Dict[str, Any]:
         benchmark_name = sanitize_benchmark_name(state["query"])
 
         # Load metadata from previous steps
-        # Loading metadata message removed
-        unitxt_data = state.get("unitxt_json", {})
-        hf_data = state.get("hf_json", {})
+        unitxt_data = state.get("unitxt_json") or {}
+        hf_data = state.get("hf_json") or {}
         docling_data = state.get("docling_output")
 
         # Create searchable documents
-        # Creating documents message removed
         indexer = MetadataIndexer()
         documents = indexer.create_documents(unitxt_data, hf_data, state["query"], docling_data)
-        # Documents created count removed
 
         # Initialize enhanced RAG retriever with lightweight model for reranking/reformulation
         from auto_benchmarkcard.config import get_light_llm_handler
@@ -1055,7 +1067,6 @@ def run_rag(state: GraphState) -> Dict[str, Any]:
                 enable_query_expansion=False,
             )
 
-        # Document indexing message removed
         retriever.index_documents(documents)
 
         # Get benchmark card (excluding risk sections for fact checking)
@@ -1069,7 +1080,6 @@ def run_rag(state: GraphState) -> Dict[str, Any]:
             engine_type=Config.LLM_ENGINE_TYPE,
             model_name=Config.LIGHT_MODEL,
         )
-        # Statements extracted count removed
 
         # Extract statement texts for batch processing
         statement_texts = []
@@ -1105,7 +1115,6 @@ def run_rag(state: GraphState) -> Dict[str, Any]:
         for statement_obj, chunks in zip(statements, batch_chunks):
             results.append({"statement": statement_obj, "retrieved_chunks": chunks})
 
-        # Retrieval completion message removed
 
         # Format results
         raw_results = {
@@ -1160,7 +1169,6 @@ def run_factreasoner(state: GraphState):
         benchmark_name = sanitize_benchmark_name(state["query"])
         rag_results = state["rag_results"]
 
-        # Evaluation progress message removed
 
         # Run factuality evaluation (uses its own FactReasoner-library LLM config)
         factuality_results = evaluate_factuality(
@@ -1249,7 +1257,6 @@ def run_factreasoner(state: GraphState):
             f"Factuality: {claims_evaluated} claims evaluated, {flagged_fields}/{claims_evaluated} fields flagged"
         )
 
-        # Entropy statistics removed for cleaner output
         logger.info("Factuality results saved to: %s", factuality_output)
         logger.info("Final benchmark card saved to: %s", output_path)
 
@@ -1424,6 +1431,7 @@ def create_initial_state(args: argparse.Namespace, output_manager: OutputManager
         "hf_extraction_attempted": False,
         "rag_results": None,
         "factuality_results": None,
+        "eee_metadata": None,
     }
 
 

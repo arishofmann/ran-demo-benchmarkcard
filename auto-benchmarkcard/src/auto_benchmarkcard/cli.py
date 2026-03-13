@@ -817,6 +817,129 @@ def process_benchmark(
         raise typer.Exit(1)
 
 
+@app.command("process-eee")
+def process_eee(
+    eee_path: Annotated[
+        str,
+        typer.Argument(
+            help="Path to EEE data directory (e.g., external/every_eval_ever/data or path to HF clone)",
+        ),
+    ],
+    output_dir: Annotated[
+        Optional[str],
+        typer.Option(
+            "--output",
+            "-o",
+            help="Custom output directory path for results",
+        ),
+    ] = None,
+    benchmarks: Annotated[
+        Optional[str],
+        typer.Option(
+            "--benchmarks",
+            "-b",
+            help="Comma-separated list of benchmark names to process (default: all)",
+        ),
+    ] = None,
+    max_files: Annotated[
+        int,
+        typer.Option(
+            "--max-files",
+            help="Max eval files to sample per benchmark folder",
+        ),
+    ] = 50,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-v", help="Enable verbose logging"),
+    ] = False,
+    debug: Annotated[
+        bool,
+        typer.Option("--debug", help="Enable debug mode"),
+    ] = False,
+) -> None:
+    """
+    Process benchmarks from Every Eval Ever (EEE) evaluation data.
+
+    Scans EEE evaluation JSONs, discovers benchmarks, resolves HuggingFace
+    repos, and generates BenchmarkCards for each discovered benchmark.
+
+    [bold green]Examples:[/bold green]
+
+        [dim]# Process all benchmarks from local EEE data[/dim]
+        benchmarkcard process-eee ./external/every_eval_ever/data
+
+        [dim]# Process specific benchmarks only[/dim]
+        benchmarkcard process-eee ./eee_data --benchmarks "IFEval,MMLU-PRO,BBH"
+
+        [dim]# From HuggingFace clone[/dim]
+        benchmarkcard process-eee ~/datasets/EEE_datastore/data
+    """
+    logger = setup_logging(verbose=verbose)
+
+    if debug:
+        enable_debug_logging()
+
+    display_banner()
+
+    console.print(f"\n[bold cyan]Starting EEE-to-BenchmarkCard Pipeline[/bold cyan]")
+    console.print(f"[dim]EEE data path: {eee_path}[/dim]")
+
+    start_time = time.time()
+
+    try:
+        from auto_benchmarkcard.eee_workflow import run_eee_pipeline
+
+        # Parse benchmark filter
+        benchmarks_filter = None
+        if benchmarks:
+            benchmarks_filter = [b.strip() for b in benchmarks.split(",")]
+            console.print(f"[dim]Filter: {', '.join(benchmarks_filter)}[/dim]")
+
+        output_path = str(Path(output_dir).resolve()) if output_dir else None
+
+        summary = run_eee_pipeline(
+            eee_path=eee_path,
+            output_path=output_path,
+            max_files_per_benchmark=max_files,
+            benchmarks_filter=benchmarks_filter,
+            debug=debug,
+        )
+
+        execution_time = time.time() - start_time
+
+        # Display summary
+        console.print(f"\n[bold green]EEE Pipeline Complete[/bold green]")
+        console.print(f"[dim]Time: {format_duration(execution_time)}[/dim]")
+
+        result_table = Table(title="Results", border_style="green")
+        result_table.add_column("Status", style="bold")
+        result_table.add_column("Count", justify="right")
+        result_table.add_column("Benchmarks")
+
+        successful = summary.get("successful", [])
+        failed = summary.get("failed", [])
+        skipped = summary.get("skipped", [])
+
+        if successful:
+            result_table.add_row("Success", str(len(successful)), ", ".join(successful[:5]))
+        if failed:
+            result_table.add_row("[red]Failed[/red]", str(len(failed)), ", ".join(failed[:5]))
+        if skipped:
+            skip_names = [s["benchmark"] for s in skipped]
+            result_table.add_row("[yellow]Skipped[/yellow]", str(len(skipped)), ", ".join(skip_names[:5]))
+
+        console.print(result_table)
+
+    except KeyboardInterrupt:
+        console.print(f"\n[yellow]Pipeline interrupted[/yellow]")
+        raise typer.Exit(130)
+    except Exception as e:
+        execution_time = time.time() - start_time
+        console.print(f"\n[red]Pipeline failed: {e}[/red]")
+        logger.error(f"EEE pipeline failed after {format_duration(execution_time)}: {e}", exc_info=verbose)
+        raise typer.Exit(1)
+
+
 @app.command("list")
 def list_outputs(
     output_dir: Annotated[
