@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # Suppress noisy logging from external libraries
@@ -30,9 +31,152 @@ from langchain_core.documents import Document
 from pydantic import BaseModel, Field
 
 # use the shared llm instance
-from auto_benchmarkcard.config import LLM, Config
+from auto_benchmarkcard.config import LLM, Config, get_light_llm_handler
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Section-specific extraction prompts — one per section
+# ---------------------------------------------------------------------------
+SECTION_EXTRACTION_PROMPTS: Dict[str, str] = {
+    "benchmark_details": (
+        "Extract key facts from the sources for these fields:\n"
+        "- name: What is the official benchmark name? Include any acronym expansion.\n"
+        "- overview: What does the benchmark measure? How many tasks/sub-datasets does it contain? "
+        "What makes it distinctive? (2-3 key facts)\n"
+        "- data_type: What is the primary data modality (text, image, audio, multimodal, tabular)?\n"
+        "- domains: What RESEARCH domains does the benchmark target? "
+        "(e.g., 'natural language inference', 'sentiment analysis' — NOT data sources like 'Wikipedia' or 'news')\n"
+        "- languages: What languages are supported? Use full names (e.g., 'English' not 'en').\n"
+        "- similar_benchmarks: What other benchmarks are explicitly compared to or cited as related? "
+        "List each by name.\n"
+        "- resources: What specific URLs are mentioned? (paper links, homepage, leaderboard, GitHub, HuggingFace)\n"
+    ),
+    "purpose_and_intended_users": (
+        "Extract key facts from the sources for these fields:\n"
+        "- goal: What is the primary research objective? What capability or behavior does the benchmark aim to measure?\n"
+        "- audience: Who are the intended users? (e.g., NLP researchers, model developers, industry practitioners)\n"
+        "- tasks: List EACH specific evaluation task or sub-task by name. "
+        "For multi-task benchmarks, list every sub-task individually.\n"
+        "- limitations: What limitations, biases, or constraints are explicitly mentioned? "
+        "Include language restrictions, domain gaps, task format limitations.\n"
+        "- out_of_scope_uses: What use cases does the benchmark explicitly NOT support? "
+        "What should it NOT be used for?\n"
+    ),
+    "data": (
+        "Extract key facts from the sources for these fields:\n"
+        "- source: List EACH sub-dataset or data source separately with its origin. "
+        "For multi-task benchmarks, name each task and where its data comes from "
+        "(e.g., 'CoLA: acceptability judgments from linguistics publications', "
+        "'SST-2: movie review sentences from Rotten Tomatoes'). "
+        "How was each collected (crowdsourced, scraped, curated)?\n"
+        "- size: How many total examples? Break down by sub-task if available. "
+        "Include train/dev/test splits if mentioned. "
+        "Prefer example counts over disk size.\n"
+        "- format: What is the data structure? (e.g., 'sentence pairs with labels', "
+        "'question-passage pairs'). What file format (JSON, CSV, parquet)?\n"
+        "- annotation: How was labeling done for each task? Who annotated (crowdworkers, experts, automatic)? "
+        "What quality control measures? Inter-annotator agreement numbers?\n"
+    ),
+    "methodology": (
+        "Extract key facts from the sources for these fields:\n"
+        "- methods: How are models evaluated? (zero-shot, few-shot, fine-tuning, submission-based). "
+        "Is there a leaderboard? How are submissions handled?\n"
+        "- metrics: List EACH metric by name (e.g., accuracy, F1, Matthews correlation, Spearman). "
+        "Note which metric is used for which task if specified.\n"
+        "- calculation: How is the overall score computed from individual task scores? "
+        "Any weighting, averaging, or normalization?\n"
+        "- interpretation: What score ranges are meaningful? What constitutes strong vs. weak performance? "
+        "Do NOT mix in human baseline numbers here — those go in baseline_results.\n"
+        "- baseline_results: What specific numerical results are reported for baselines or human performance? "
+        "Include model names and their scores (e.g., 'BERT: 80.5 accuracy', 'Human: 87.1 F1'). "
+        "Only include numbers explicitly stated in the sources.\n"
+        "- validation: What quality assurance measures exist? (diagnostic sets, inter-annotator agreement, "
+        "reproducibility checks)\n"
+    ),
+    "ethical_and_legal_considerations": (
+        "Extract key facts from the sources for these fields:\n"
+        "- privacy_and_anonymity: Does the data contain personal information? "
+        "What anonymization was applied? Is data from public or private sources?\n"
+        "- data_licensing: What specific license applies? (e.g., CC BY-SA 4.0, MIT, Apache 2.0). "
+        "Are there usage restrictions?\n"
+        "- consent_procedures: How were data subjects or annotators consented? "
+        "Were crowdworkers compensated? What platform was used (MTurk, etc.)?\n"
+        "- compliance_with_regulations: Any mention of IRB approval, GDPR compliance, "
+        "ethical review board, or institutional oversight?\n"
+    ),
+}
+
+_EXTRACTOR_SYSTEM = (
+    "You are a fact extraction assistant. Your job is to read the provided sources "
+    "about an AI benchmark and extract ONLY the key facts relevant to the requested fields.\n\n"
+    "RULES:\n"
+    "1. Return facts as short bullet points grouped by field name.\n"
+    "2. Only include what the sources EXPLICITLY state. Do not infer or invent.\n"
+    "3. If a source says nothing about a field, write: '- No information found'\n"
+    "4. Keep each bullet point to ONE fact, ONE sentence.\n"
+    "5. Prefer specific numbers, names, and quotes over vague summaries.\n"
+    "6. Do NOT repeat the same fact under multiple fields.\n"
+)
+
+
+def extract_section_facts(
+    section_name: str,
+    paper_content: str,
+    hf_metadata: Optional[Dict[str, Any]],
+    unitxt_metadata: Optional[Dict[str, Any]],
+    extracted_ids: Optional[Dict[str, Any]] = None,
+    query: str = "",
+) -> str:
+    """Use the light model to extract key facts for a section before composition.
+
+    Args:
+        section_name: Name of the benchmark card section.
+        paper_content: Retrieved paper chunks (already filtered by RAG-lite).
+        hf_metadata: HuggingFace metadata dict.
+        unitxt_metadata: UnitXT catalog metadata dict.
+        extracted_ids: Optional extracted identifiers.
+        query: Benchmark name.
+
+    Returns:
+        Extracted facts as a formatted string of bullet points per field.
+    """
+    extraction_prompt = SECTION_EXTRACTION_PROMPTS.get(section_name)
+    if not extraction_prompt:
+        logger.warning("No extraction prompt for section %s, skipping extraction", section_name)
+        return ""
+
+    # Format sources compactly
+    hf_text = "Not available"
+    if hf_metadata:
+        hf_compact = _compact_hf_metadata(hf_metadata) if isinstance(hf_metadata, dict) else {}
+        hf_text = json.dumps(hf_compact, indent=2) if hf_compact else "Not available"
+
+    unitxt_text = json.dumps(unitxt_metadata, indent=2) if unitxt_metadata else "Not available"
+    ids_text = json.dumps(extracted_ids, indent=2) if extracted_ids else "Not available"
+
+    user_message = (
+        f"Benchmark: {query}\n\n"
+        f"SOURCES:\n\n"
+        f"1. PAPER CONTENT:\n{paper_content}\n\n"
+        f"2. HuggingFace Dataset:\n{hf_text}\n\n"
+        f"3. UnitXT Catalog:\n{unitxt_text}\n\n"
+        f"4. Extracted IDs:\n{ids_text}\n\n"
+        f"---\n\n"
+        f"{extraction_prompt}\n"
+        f"Return facts as short bullet points per field. Only include what the sources explicitly state."
+    )
+
+    prompt = f"{_EXTRACTOR_SYSTEM}\n\n{user_message}"
+
+    try:
+        light_llm = get_light_llm_handler()
+        facts = light_llm.generate(prompt)
+        logger.debug("Extracted facts for %s (%d chars)", section_name, len(facts))
+        return facts
+    except Exception as e:
+        logger.warning("Fact extraction failed for %s: %s — composer will use raw sources", section_name, e)
+        return ""
 
 
 def _compact_hf_metadata(hf_metadata: Dict[str, Any]) -> Dict[str, Any]:
@@ -362,7 +506,7 @@ def compose_benchmark_card(
 
                 # Create vectorstore and retriever
                 paper_vectorstore = Chroma.from_documents(documents, embeddings)
-                paper_retriever = paper_vectorstore.as_retriever(search_kwargs={"k": 3})
+                paper_retriever = paper_vectorstore.as_retriever(search_kwargs={"k": 5})
                 logger.debug(f"Paper indexed: {len(chunks)} chunks ready for retrieval")
         except Exception as e:
             logger.warning(f"Failed to initialize paper retriever: {e}")
@@ -378,49 +522,42 @@ def compose_benchmark_card(
     ]
 
     # Section-specific query templates for retrieval
+    # Multiple queries per section to improve recall across different paper sections
     section_queries = {
-        "benchmark_details": "benchmark name overview domains languages similar benchmarks resources",
-        "data": "dataset size format annotation data collection data statistics",
-        "methodology": "evaluation methods metrics calculation baseline results performance",
-        "purpose_and_intended_users": "goal purpose motivation audience tasks limitations",
-        "ethical_and_legal_considerations": "ethics privacy licensing consent compliance regulations",
+        "benchmark_details": [
+            "benchmark name overview introduction contribution",
+            "related work similar benchmarks comparison",
+            "resources homepage leaderboard repository URL",
+        ],
+        "data": [
+            "dataset collection source corpus sub-task data origin",
+            "dataset size examples training test split statistics",
+            "annotation crowdsource label annotator agreement quality",
+        ],
+        "methodology": [
+            "evaluation method metrics accuracy F1 score measurement",
+            "baseline results performance human comparison model scores",
+            "diagnostic analysis validation quality assurance",
+        ],
+        "purpose_and_intended_users": [
+            "goal objective motivation purpose research question",
+            "tasks sub-tasks evaluation individual task description",
+            "limitations bias constraints scope out-of-scope",
+        ],
+        "ethical_and_legal_considerations": [
+            "ethics privacy anonymity personal information",
+            "license consent crowdworker compensation IRB",
+        ],
     }
 
-    has_paper = bool(docling_output and docling_output.get("success"))
-    has_hf = bool(hf_metadata)
-    has_unitxt = bool(unitxt_metadata)
-
-    # Build source priority text dynamically based on available sources
-    if has_paper:
-        source_priority_text = """SOURCE PRIORITY (varies by field type):
-
-CONCEPTUAL FIELDS (Paper is primary source):
-- overview, goal, audience, tasks, limitations, out_of_scope_uses,
-  methods, calculation, interpretation, baseline_results, validation,
-  similar_benchmarks, annotation
-→ Priority: Paper > HuggingFace > UnitXT
-
-OPERATIONAL/METADATA FIELDS (HuggingFace is primary source):
-- size, format, languages, data_licensing, resources
-→ Priority: HuggingFace > Paper > UnitXT
-
-STRUCTURAL FIELDS (UnitXT is primary source):
-- metrics, domains, data_type
-→ Priority: UnitXT tags > Paper > HuggingFace
-
-WHEN SOURCES CONFLICT:
-- Use the value from the PRIMARY source for that field type
-- Note the conflict in provenance (see CONFLICT HANDLING below)
-- Do NOT average or merge conflicting values"""
-    else:
-        source_priority_text = """SOURCE PRIORITY (no academic paper available):
-1. HuggingFace README and metadata (PRIMARY - treat as authoritative description)
-2. UnitXT metadata (catalog and task metadata)
-3. Extracted IDs (for URLs and identifiers)
-
-NOTE: No academic paper was found for this benchmark.
-Rely on HuggingFace README as the main descriptive source.
-For structural/task fields, prefer UnitXT metadata."""
+    # Load the gold example for format anchoring
+    gold_example_path = Path(__file__).parent / "gold_example.json"
+    gold_example: Dict[str, Any] = {}
+    try:
+        gold_example = json.loads(gold_example_path.read_text())
+        logger.debug("Loaded gold example for format anchoring")
+    except Exception as e:
+        logger.warning("Could not load gold example: %s", e)
 
     generated_sections = {}
     all_provenance = {}
@@ -428,18 +565,27 @@ For structural/task fields, prefer UnitXT metadata."""
     for section_name, section_class in sections:
         logger.debug("Generating %s", section_name.replace("_", " ").title())
 
-        # Retrieve relevant paper chunks for this section using RAG-lite
+        # ── Step 0: Retrieve relevant paper chunks (RAG-lite) ──
+        # Uses multiple queries per section for broader coverage, deduplicates by content
         paper_content = "Not available"
         if paper_retriever:
             try:
-                query = section_queries.get(section_name, section_name.replace("_", " "))
-                relevant_chunks = paper_retriever.get_relevant_documents(query)
+                queries = section_queries.get(section_name, [section_name.replace("_", " ")])
+                # Collect unique chunks from all sub-queries
+                seen_chunks = set()
+                all_chunks = []
+                for sq in queries:
+                    for chunk in paper_retriever.get_relevant_documents(sq):
+                        chunk_key = chunk.page_content[:200]
+                        if chunk_key not in seen_chunks:
+                            seen_chunks.add(chunk_key)
+                            all_chunks.append(chunk)
 
-                if relevant_chunks:
+                if all_chunks:
                     formatted_chunks = []
-                    char_budget = 1500
+                    char_budget = 3000
                     chars_used = 0
-                    for i, chunk in enumerate(relevant_chunks, 1):
+                    for i, chunk in enumerate(all_chunks, 1):
                         text = chunk.page_content
                         if chars_used + len(text) > char_budget:
                             remaining = char_budget - chars_used
@@ -449,39 +595,136 @@ For structural/task fields, prefer UnitXT metadata."""
                         formatted_chunks.append(f"[Paper Section {i}]\n{text}")
                         chars_used += len(text)
                     paper_content = "\n\n".join(formatted_chunks)
-                    logger.debug(f"Retrieved {len(relevant_chunks)} paper chunks for {section_name}")
+                    logger.debug(f"Retrieved {len(all_chunks)} unique paper chunks for {section_name} (from {len(queries)} queries)")
                 else:
                     logger.debug(f"No relevant chunks found for {section_name}, using fallback")
                     if docling_output and docling_output.get("filtered_text"):
-                        paper_content = docling_output.get("filtered_text", "")[:1500]
+                        paper_content = docling_output.get("filtered_text", "")[:3000]
             except Exception as e:
                 logger.warning(f"Paper retrieval failed for {section_name}: {e}")
                 if docling_output and docling_output.get("filtered_text"):
-                    paper_content = docling_output.get("filtered_text", "")[:1500]
+                    paper_content = docling_output.get("filtered_text", "")[:3000]
         elif docling_output and docling_output.get("success"):
-            paper_content = docling_output.get("filtered_text", "Not available")[:1500]
+            paper_content = docling_output.get("filtered_text", "Not available")[:3000]
 
-        # set up section-specific prompt
-        section_prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    f"""You are documenting an AI benchmark. Generate the '{section_name}' section.
+        # ── Step 1: EXTRACT — light model extracts key facts ──
+        extracted_facts = extract_section_facts(
+            section_name=section_name,
+            paper_content=paper_content,
+            hf_metadata=hf_metadata,
+            unitxt_metadata=unitxt_metadata,
+            extracted_ids=extracted_ids,
+            query=query,
+        )
+
+        # ── Step 2: COMPOSE — heavy model formats facts into schema ──
+        # Build the gold example snippet for this section
+        # Escape curly braces so ChatPromptTemplate doesn't treat them as variables
+        gold_snippet = ""
+        if gold_example and section_name in gold_example:
+            gold_json = json.dumps(gold_example[section_name], indent=2)
+            gold_json_escaped = gold_json.replace("{", "{{").replace("}", "}}")
+            gold_snippet = (
+                f"\n\nGOLD EXAMPLE (use this as a FORMAT reference — match the style, length, and level of detail):\n"
+                f"```json\n{gold_json_escaped}\n```"
+            )
+
+        # Choose prompt based on whether extraction succeeded
+        if extracted_facts:
+            # Extraction succeeded → composer gets compressed facts
+            section_prompt = ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        f"""You are documenting an AI benchmark. Generate the '{section_name}' section.
+
+You are given PRE-EXTRACTED FACTS (bullet points) that have already been filtered from the original sources. Your job is to FORMAT these facts into the required JSON schema — do NOT add information beyond what the facts state.
+
+RULES:
+1. Use ONLY the extracted facts below. If a field has no facts, write exactly "Not specified".
+2. Write in third person. Describe the benchmark objectively.
+3. Do not invent facts, URLs, numbers, or performance scores.
+4. Be concise. Match the style and length of the gold example.
+5. Each field value should be a clean, well-written summary of the relevant facts — not a dump of all bullets.
+{gold_snippet}
+
+PROVENANCE TRACKING (REQUIRED):
+For every field you fill in (except "Not specified"), include a provenance entry:
+{{{{
+  "provenance": {{{{
+    "field_name": {{{{
+      "source": "paper|huggingface|unitxt|extracted_ids",
+      "evidence": "the key fact that supports this field value"
+    }}}}
+  }}}}
+}}}}""",
+                    ),
+                    (
+                        "user",
+                        f"""Benchmark: {{query}}
+
+EXTRACTED FACTS:
+{{extracted_facts}}
+
+Generate the {section_name} section by formatting these facts into the required schema.""",
+                    ),
+                ]
+            )
+
+            chain = section_prompt | LLM.with_structured_output(section_class)
+
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    section_result = chain.invoke(
+                        {
+                            "query": query,
+                            "extracted_facts": extracted_facts,
+                        }
+                    )
+                    section_dict = section_result.model_dump()
+                    clean_section, section_provenance = extract_provenance(section_dict)
+                    generated_sections[section_name] = clean_section
+                    if section_provenance:
+                        all_provenance[section_name] = section_provenance
+                    logger.debug("%s completed (extract→compose)", section_name.replace("_", " ").title())
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        logger.warning("Failed to compose %s (attempt %d/%d): %s", section_name, attempt + 1, max_retries, e)
+                    else:
+                        logger.error("Failed to compose %s after %d attempts: %s", section_name, max_retries, e)
+                        raise
+        else:
+            # Extraction failed → fallback to direct composition with raw sources
+            logger.info("Extraction failed for %s, falling back to direct composition", section_name)
+
+            hf_formatted = "Not available"
+            if hf_metadata:
+                if isinstance(hf_metadata, dict):
+                    hf_compact = _compact_hf_metadata(hf_metadata)
+                    hf_formatted = json.dumps(hf_compact, indent=2) if hf_compact else "Not available"
+                else:
+                    hf_formatted = str(hf_metadata)[:2000]
+
+            unitxt_formatted = json.dumps(unitxt_metadata, indent=2) if unitxt_metadata else "Not available"
+            extracted_formatted = json.dumps(extracted_ids, indent=2) if extracted_ids else "Not available"
+
+            section_prompt = ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        f"""You are documenting an AI benchmark. Generate the '{section_name}' section.
 
 RULES:
 1. Use ONLY the provided metadata sources. If information is not found, write exactly "Not specified".
-2. Write in third person. Describe the benchmark objectively ("The benchmark evaluates..." not "We evaluate..."). When a source uses "we/our", rephrase into third-person descriptive language.
+2. Write in third person. Describe the benchmark objectively.
 3. Do not invent facts, URLs, numbers, or performance scores. Only include what the sources explicitly state.
-
-{source_priority_text}
-
-AMBIGUOUS FIELDS:
-- data.size: Prefer example counts from the paper (e.g., "817 questions"). If unavailable, use HuggingFace disk size (e.g., "1.24 GB"). Do not conflate the two.
-- data.format: Prefer the format described in the paper or README. If only the HuggingFace hosting format is known, note it (e.g., "parquet (HuggingFace hosting format)").
-- benchmark_details.languages: Use full names (e.g., "English" not "en").
+4. Be concise. Match the style and length of the gold example.
+{gold_snippet}
 
 PROVENANCE TRACKING (REQUIRED):
-For every field you fill in (except "Not specified"), include a provenance entry mapping the field name to its source and a supporting quote:
+For every field you fill in (except "Not specified"), include a provenance entry:
 {{{{
   "provenance": {{{{
     "field_name": {{{{
@@ -489,21 +732,11 @@ For every field you fill in (except "Not specified"), include a provenance entry
       "evidence": "exact quote or description from the source"
     }}}}
   }}}}
-}}}}
-If sources conflict, use the primary source for that field type and add a "conflict" key:
-{{{{
-  "provenance": {{{{
-    "field_name": {{{{
-      "source": "huggingface",
-      "evidence": "Total amount of disk used: 1.24 GB",
-      "conflict": "Paper states 10K examples but no disk size"
-    }}}}
-  }}}}
 }}}}""",
-                ),
-                (
-                    "user",
-                    f"""Benchmark: {{query}}
+                    ),
+                    (
+                        "user",
+                        f"""Benchmark: {{query}}
 
 METADATA SOURCES:
 
@@ -520,73 +753,37 @@ METADATA SOURCES:
 {{extracted_ids}}
 
 Generate the {section_name} section using ONLY the sources above.""",
-                ),
-            ]
-        )
+                    ),
+                ]
+            )
 
-        # configure for structured output
-        llm_with_structure = LLM.with_structured_output(section_class)
+            chain = section_prompt | LLM.with_structured_output(section_class)
 
-        # create and run the chain
-        chain = section_prompt | llm_with_structure
-
-        # Retry logic for robust generation
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                # Format metadata for prompt (JSON for structured sources)
-                hf_formatted = "Not available"
-                if hf_metadata:
-                    if isinstance(hf_metadata, dict):
-                        hf_compact = _compact_hf_metadata(hf_metadata)
-                        hf_formatted = json.dumps(hf_compact, indent=2) if hf_compact else "Not available"
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    section_result = chain.invoke(
+                        {
+                            "query": query,
+                            "paper_content": paper_content,
+                            "hf_metadata": hf_formatted,
+                            "unitxt_metadata": unitxt_formatted,
+                            "extracted_ids": extracted_formatted,
+                        }
+                    )
+                    section_dict = section_result.model_dump()
+                    clean_section, section_provenance = extract_provenance(section_dict)
+                    generated_sections[section_name] = clean_section
+                    if section_provenance:
+                        all_provenance[section_name] = section_provenance
+                    logger.debug("%s completed (direct)", section_name.replace("_", " ").title())
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        logger.warning("Failed to generate %s (attempt %d/%d): %s", section_name, attempt + 1, max_retries, e)
                     else:
-                        hf_formatted = str(hf_metadata)[:2000]
-
-                unitxt_formatted = json.dumps(unitxt_metadata, indent=2) if unitxt_metadata else "Not available"
-                extracted_formatted = json.dumps(extracted_ids, indent=2) if extracted_ids else "Not available"
-
-                section_result = chain.invoke(
-                    {
-                        "query": query,
-                        "paper_content": paper_content,
-                        "hf_metadata": hf_formatted,
-                        "unitxt_metadata": unitxt_formatted,
-                        "extracted_ids": extracted_formatted,
-                    }
-                )
-
-                # Extract provenance from section data
-                section_dict = section_result.model_dump()
-                clean_section, section_provenance = extract_provenance(section_dict)
-                generated_sections[section_name] = clean_section
-                if section_provenance:
-                    all_provenance[section_name] = section_provenance
-
-                logger.debug("%s completed", section_name.replace("_", " ").title())
-                logger.debug("Preview: %s", str(clean_section)[:100] + "...")
-                break  # Success, exit retry loop
-
-            except Exception as e:
-                attempt_msg = f"(attempt {attempt + 1}/{max_retries})"
-                if attempt < max_retries - 1:
-                    logger.warning("Failed to generate %s %s: %s", section_name, attempt_msg, e)
-                    logger.debug("Retrying %s", section_name)
-                    continue
-                else:
-                    logger.error(
-                        "Failed to compose %s section after %d attempts: %s",
-                        section_name,
-                        max_retries,
-                        e,
-                    )
-                    logger.error(
-                        "Failed to generate %s after %d attempts: %s",
-                        section_name,
-                        max_retries,
-                        e,
-                    )
-                    raise
+                        logger.error("Failed to generate %s after %d attempts: %s", section_name, max_retries, e)
+                        raise
 
     # combine all sections into final benchmark card
     logger.debug("Combining all sections into final benchmark card")
@@ -631,7 +828,7 @@ Generate the {section_name} section using ONLY the sources above.""",
             },
             "query": query,
             "composition_timestamp": datetime.now().isoformat(),
-            "generation_method": "chunked_sections",
+            "generation_method": "extract_then_compose",
             "model_used": LLM.model_name,
         },
     }
