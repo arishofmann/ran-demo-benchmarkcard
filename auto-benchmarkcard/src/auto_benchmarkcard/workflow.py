@@ -359,6 +359,11 @@ def _backfill_from_provenance(
                 continue
 
             evidence = field_prov["evidence"]
+            # Skip evidence that is itself a "not specified" / "no information" variant
+            if isinstance(evidence, str) and any(
+                neg in evidence.lower() for neg in ["no information", "not specified", "not available", "none found"]
+            ):
+                continue
             if is_not_specified(field_val) and len(evidence) > 10:
                 logger.debug(
                     "Backfilling %s.%s from provenance (%s)",
@@ -1195,12 +1200,49 @@ def run_factreasoner(state: GraphState):
         provenance_data = composed_card_data.get("provenance") if isinstance(composed_card_data, dict) else None
 
         field_analysis = factuality_results.get("field_analysis", {})
+
+        # Field-type-aware scoring: different thresholds for different field types
+        # Identity fields (overview, goal, domains) are descriptive — relaxed threshold
+        # Factual fields (annotation, size, baseline_results) need strict verification
+        # Analytical fields (limitations, out_of_scope) are reasoned — skip flagging
+        _IDENTITY_FIELDS = {
+            "benchmark_details.overview", "benchmark_details.domains",
+            "benchmark_details.data_type", "benchmark_details.similar_benchmarks",
+            "purpose_and_intended_users.goal", "purpose_and_intended_users.audience",
+            "purpose_and_intended_users.tasks",
+        }
+        _ANALYTICAL_FIELDS = {
+            "purpose_and_intended_users.limitations",
+            "purpose_and_intended_users.out_of_scope_uses",
+            "methodology.interpretation",
+        }
+
+        # Use standard threshold for factual fields, relaxed for identity, skip analytical
         flagged_card = flag_benchmark_card_fields(
             benchmark_card=clean_card,
             field_analysis=field_analysis,
             threshold=Config.DEFAULT_FACTUALITY_THRESHOLD,
             provenance=provenance_data,
         )
+
+        # Post-flagging: remove flags for identity and analytical fields
+        # Identity fields get a relaxed standard — only flag if very low confidence
+        # Analytical fields are reasoned, not extracted — never flag based on NLI
+        if "flagged_fields" in flagged_card and isinstance(flagged_card["flagged_fields"], dict):
+            fields_to_unflag = []
+            for field_name, flag_reason in flagged_card["flagged_fields"].items():
+                if field_name in _ANALYTICAL_FIELDS:
+                    fields_to_unflag.append(field_name)
+                    logger.debug("Unflagging analytical field %s (reasoned, not extracted)", field_name)
+                elif field_name in _IDENTITY_FIELDS and "Possible Hallucination" in str(flag_reason):
+                    # Only unflag identity fields if they were neutral (no evidence),
+                    # not if they had low factuality scores (which indicates actual errors)
+                    fields_to_unflag.append(field_name)
+                    logger.debug("Unflagging identity field %s (neutral NLI expected for descriptive content)", field_name)
+            for field_name in fields_to_unflag:
+                del flagged_card["flagged_fields"][field_name]
+            if fields_to_unflag:
+                logger.info("Field-type-aware scoring: unflagged %d identity/analytical fields", len(fields_to_unflag))
 
         # Backfill: if a field says "Not specified" but provenance has evidence, use it
         if provenance_data:

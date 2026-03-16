@@ -4,12 +4,23 @@ This module provides functionality to compose structured benchmark cards
 from heterogeneous metadata sources using large language models. It combines
 data from UnitXT, HuggingFace, academic papers, and other sources into
 standardized benchmark documentation.
+
+Architecture: Source-isolated extraction → Merge → Compose → Override → Post-process
+- Paper facts described in isolation (1 LLM call) — LLM rephrases, not copies
+- HF README facts described in isolation (1 LLM call) — full README, RAG-indexed
+- Deterministic facts from EEE/HF tags (no LLM)
+- Facts merged with source tags
+- Heavy model composes each section from tagged facts
+- Deterministic overrides for factual fields (metrics, license, etc.)
+- Post-processing for schema consistency
+- FactReasoner provides semantic verification (no regex string-matching)
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -31,180 +42,1036 @@ from langchain_core.documents import Document
 from pydantic import BaseModel, Field
 
 # use the shared llm instance
-from auto_benchmarkcard.config import LLM, Config, get_light_llm_handler
+from auto_benchmarkcard.config import LLM, Config
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Section-specific extraction prompts — one per section
+# Source-isolated extraction prompts
 # ---------------------------------------------------------------------------
-SECTION_EXTRACTION_PROMPTS: Dict[str, str] = {
-    "benchmark_details": (
-        "Extract key facts from the sources for these fields:\n"
-        "- name: What is the official benchmark name? Include any acronym expansion.\n"
-        "- overview: What does the benchmark measure? How many tasks/sub-datasets does it contain? "
-        "What makes it distinctive? (2-3 key facts)\n"
-        "- data_type: What is the primary data modality (text, image, audio, multimodal, tabular)?\n"
-        "- domains: What RESEARCH domains does the benchmark target? "
-        "(e.g., 'natural language inference', 'sentiment analysis' — NOT data sources like 'Wikipedia' or 'news')\n"
-        "- languages: What languages are supported? Use full names (e.g., 'English' not 'en').\n"
-        "- similar_benchmarks: What other benchmarks are explicitly compared to or cited as related? "
-        "List each by name.\n"
-        "- resources: What specific URLs are mentioned? (paper links, homepage, leaderboard, GitHub, HuggingFace)\n"
-    ),
-    "purpose_and_intended_users": (
-        "Extract key facts from the sources for these fields:\n"
-        "- goal: What is the primary research objective? What capability or behavior does the benchmark aim to measure?\n"
-        "- audience: Who are the intended users? (e.g., NLP researchers, model developers, industry practitioners)\n"
-        "- tasks: List EACH specific evaluation task or sub-task by name. "
-        "For multi-task benchmarks, list every sub-task individually.\n"
-        "- limitations: What limitations, biases, or constraints are explicitly mentioned? "
-        "Include language restrictions, domain gaps, task format limitations.\n"
-        "- out_of_scope_uses: What use cases does the benchmark explicitly NOT support? "
-        "What should it NOT be used for?\n"
-    ),
-    "data": (
-        "Extract key facts from the sources for these fields:\n"
-        "- source: List EACH sub-dataset or data source separately with its origin. "
-        "For multi-task benchmarks, name each task and where its data comes from "
-        "(e.g., 'CoLA: acceptability judgments from linguistics publications', "
-        "'SST-2: movie review sentences from Rotten Tomatoes'). "
-        "How was each collected (crowdsourced, scraped, curated)?\n"
-        "- size: How many total examples? Break down by sub-task if available. "
-        "Include train/dev/test splits if mentioned. "
-        "Prefer example counts over disk size.\n"
-        "- format: What is the data structure? (e.g., 'sentence pairs with labels', "
-        "'question-passage pairs'). What file format (JSON, CSV, parquet)?\n"
-        "- annotation: How was labeling done for each task? Who annotated (crowdworkers, experts, automatic)? "
-        "What quality control measures? Inter-annotator agreement numbers?\n"
-    ),
-    "methodology": (
-        "Extract key facts from the sources for these fields:\n"
-        "- methods: How are models evaluated? (zero-shot, few-shot, fine-tuning, submission-based). "
-        "Is there a leaderboard? How are submissions handled?\n"
-        "- metrics: List EACH metric by name (e.g., accuracy, F1, Matthews correlation, Spearman). "
-        "Note which metric is used for which task if specified.\n"
-        "- calculation: How is the overall score computed from individual task scores? "
-        "Any weighting, averaging, or normalization?\n"
-        "- interpretation: What score ranges are meaningful? What constitutes strong vs. weak performance? "
-        "Do NOT mix in human baseline numbers here — those go in baseline_results.\n"
-        "- baseline_results: What specific numerical results are reported for baselines or human performance? "
-        "Include model names and their scores (e.g., 'BERT: 80.5 accuracy', 'Human: 87.1 F1'). "
-        "Only include numbers explicitly stated in the sources.\n"
-        "- validation: What quality assurance measures exist? (diagnostic sets, inter-annotator agreement, "
-        "reproducibility checks)\n"
-    ),
-    "ethical_and_legal_considerations": (
-        "Extract key facts from the sources for these fields:\n"
-        "- privacy_and_anonymity: Does the data contain personal information? "
-        "What anonymization was applied? Is data from public or private sources?\n"
-        "- data_licensing: What specific license applies? (e.g., CC BY-SA 4.0, MIT, Apache 2.0). "
-        "Are there usage restrictions?\n"
-        "- consent_procedures: How were data subjects or annotators consented? "
-        "Were crowdworkers compensated? What platform was used (MTurk, etc.)?\n"
-        "- compliance_with_regulations: Any mention of IRB approval, GDPR compliance, "
-        "ethical review board, or institutional oversight?\n"
-    ),
-}
+
+PAPER_EXTRACTION_PROMPT = """Read this research paper about the benchmark "{benchmark_name}" and describe what it says about each field below.
+
+{identity_anchor}
+CRITICAL RULES:
+1. Write in your own words based on what the paper says. Do NOT copy text verbatim — rephrase clearly.
+2. Base your descriptions ONLY on the paper text provided. Do NOT use knowledge from your training data.
+3. IMPORTANT: You are extracting facts about "{benchmark_name}" ONLY. Do NOT confuse it with any other benchmark mentioned or discussed in the paper. If the paper discusses multiple benchmarks or datasets, only describe what pertains to "{benchmark_name}" itself.
+4. If the paper says nothing about a field, write: "- No information found"
+5. For each field, write 1-3 clear sentences that capture the key information.
+6. Use precise numbers when the paper provides them, but integrate them naturally into your description.
+7. If a fact seems to be about a different topic than "{benchmark_name}", do NOT include it.
+
+Describe these fields:
+
+## benchmark_details
+- name: Official benchmark name and any acronym expansion
+- overview: What does it measure? How many tasks/datasets? What makes it distinctive?
+- data_type: Primary data modality (text, image, audio, multimodal, tabular)
+- domains: Research domains or subject areas covered
+- similar_benchmarks: ONLY benchmarks the paper explicitly compares to or names as related. If none, write "- No information found"
+- resources: URLs mentioned in the paper (homepage, leaderboard, GitHub)
+
+## purpose_and_intended_users
+- goal: What is the primary research objective?
+- audience: Who is this benchmark designed for?
+- tasks: What specific evaluation tasks or sub-tasks does it include?
+- limitations: What limitations, biases, or constraints does the paper acknowledge?
+- out_of_scope_uses: What is the benchmark explicitly NOT designed for?
+
+## data
+- source: Where does the data come from and how was it collected?
+- size: How many examples, and what are the train/dev/test splits?
+- format: How is the data structured?
+- annotation: How was labeling done, who annotated, what quality control was used?
+
+## methodology
+- methods: How are models evaluated (zero-shot, few-shot, fine-tuning, etc.)?
+- metrics: What metrics are used (list each by name)?
+- calculation: How is the overall score computed from individual scores?
+- interpretation: What score ranges indicate strong vs weak performance?
+- baseline_results: What specific model results does the paper report? (include model names and scores)
+- validation: What quality assurance or validation procedures were used?
+
+## ethical_and_legal_considerations
+- privacy_and_anonymity: How is PII handled? Is data anonymized?
+- consent_procedures: How were crowdworkers or annotators compensated? What platform was used?
+- compliance_with_regulations: Was there IRB approval, GDPR compliance, or ethical review?
+
+PAPER TEXT:
+{paper_content}"""
+
+HF_README_EXTRACTION_PROMPT = """Read this HuggingFace dataset page about the benchmark "{benchmark_name}" and describe what it says about each field below.
+
+{identity_anchor}
+CRITICAL RULES:
+1. Write in your own words based on what the page says. Do NOT copy text verbatim — rephrase clearly.
+2. Base your descriptions ONLY on the text provided. Do NOT use knowledge from your training data.
+3. You are extracting facts about "{benchmark_name}" ONLY. Do NOT confuse it with any other benchmark or dataset.
+4. If information is not found, write: "- No information found"
+5. For each field, write 1-3 clear sentences capturing the key information.
+
+Describe these fields:
+
+## benchmark_details
+- overview: What does this benchmark measure? What makes it distinctive?
+- domains: What research domains or subject areas does it cover?
+
+## purpose_and_intended_users
+- goal: What is the purpose of this benchmark?
+- tasks: What evaluation tasks does it include?
+- limitations: What limitations are mentioned?
+
+## data
+- source: Where does the data come from and how was it collected?
+- size: How many examples or how large is the dataset?
+- annotation: How was the annotation process conducted?
+
+## methodology
+- methods: How are models evaluated?
+- metrics: What metrics are used?
+- baseline_results: What model scores or baselines are reported?
+
+## ethical_and_legal_considerations
+- Any ethical considerations mentioned
+
+HUGGINGFACE DATASET PAGE:
+{hf_content}"""
 
 _EXTRACTOR_SYSTEM = (
-    "You are a fact extraction assistant. Your job is to read the provided sources "
-    "about an AI benchmark and extract ONLY the key facts relevant to the requested fields.\n\n"
-    "RULES:\n"
-    "1. Return facts as short bullet points grouped by field name.\n"
-    "2. Only include what the sources EXPLICITLY state. Do not infer or invent.\n"
-    "3. If a source says nothing about a field, write: '- No information found'\n"
-    "4. Keep each bullet point to ONE fact, ONE sentence.\n"
-    "5. Prefer specific numbers, names, and quotes over vague summaries.\n"
-    "6. Do NOT repeat the same fact under multiple fields.\n"
+    "You are a precise research assistant that reads source material and describes what it says. "
+    "You rephrase information in your own words — you do NOT copy text verbatim. "
+    "You NEVER use your own knowledge about benchmarks or AI — only what the provided text says. "
+    "If something is not in the text, you say 'No information found'. "
+    "CRITICAL: You must ONLY extract facts about the specific benchmark named in the prompt. "
+    "Do NOT confuse it with other benchmarks, datasets, or methods discussed in the same paper. "
+    "If the paper discusses multiple benchmarks, only describe facts about the TARGET benchmark."
 )
 
+# Section-specific RAG queries for paper retrieval
+SECTION_QUERIES = {
+    "benchmark_details": [
+        "benchmark name overview introduction contribution",
+        "related work similar benchmarks comparison",
+        "resources homepage leaderboard repository URL",
+    ],
+    "data": [
+        "dataset collection source corpus sub-task data origin",
+        "dataset size examples training test split statistics",
+        "annotation crowdsource label annotator agreement quality",
+    ],
+    "methodology": [
+        "evaluation method metrics accuracy F1 score measurement",
+        "baseline results performance human comparison model scores",
+        "diagnostic analysis validation quality assurance",
+    ],
+    "purpose_and_intended_users": [
+        "goal objective motivation purpose research question",
+        "tasks sub-tasks evaluation individual task description",
+        "limitations bias constraints scope out-of-scope",
+    ],
+    "ethical_and_legal_considerations": [
+        "ethics privacy anonymity personal information",
+        "license consent crowdworker compensation IRB",
+    ],
+}
 
-def extract_section_facts(
-    section_name: str,
-    paper_content: str,
-    hf_metadata: Optional[Dict[str, Any]],
-    unitxt_metadata: Optional[Dict[str, Any]],
-    extracted_ids: Optional[Dict[str, Any]] = None,
-    query: str = "",
+ALL_SECTIONS = [
+    "benchmark_details",
+    "purpose_and_intended_users",
+    "data",
+    "methodology",
+    "ethical_and_legal_considerations",
+]
+
+# Language code → full name mapping
+LANG_MAP = {
+    "en": "English", "zh": "Chinese", "de": "German", "fr": "French",
+    "es": "Spanish", "ja": "Japanese", "ko": "Korean", "pt": "Portuguese",
+    "ru": "Russian", "ar": "Arabic", "hi": "Hindi", "it": "Italian",
+    "nl": "Dutch", "pl": "Polish", "tr": "Turkish", "vi": "Vietnamese",
+    "th": "Thai", "sv": "Swedish", "da": "Danish", "fi": "Finnish",
+    "multilingual": "Multilingual",
+}
+
+
+# ---------------------------------------------------------------------------
+# Benchmark identity anchor
+# ---------------------------------------------------------------------------
+
+def _get_benchmark_identity(
+    benchmark_name: str,
+    hf_metadata: Optional[Dict[str, Any]] = None,
     eee_metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Use the light model to extract key facts for a section before composition.
+    """Build a brief identity anchor for the benchmark from deterministic sources.
 
-    Args:
-        section_name: Name of the benchmark card section.
-        paper_content: Retrieved paper chunks (already filtered by RAG-lite).
-        hf_metadata: HuggingFace metadata dict.
-        unitxt_metadata: UnitXT catalog metadata dict.
-        extracted_ids: Optional extracted identifiers.
-        query: Benchmark name.
-        eee_metadata: Optional EEE evaluation metadata (metrics, scores, etc.).
-
-    Returns:
-        Extracted facts as a formatted string of bullet points per field.
+    This tells the LLM what topic/domain this benchmark covers, preventing it
+    from confusing it with other benchmarks (e.g., IFEval vs GSM8K).
+    Returns a short string like:
+    'BENCHMARK IDENTITY: IFEval is about instruction following, evaluation.'
     """
-    extraction_prompt = SECTION_EXTRACTION_PROMPTS.get(section_name)
-    if not extraction_prompt:
-        logger.warning("No extraction prompt for section %s, skipping extraction", section_name)
+    signals = []
+
+    if hf_metadata:
+        meta = _get_hf_meta(hf_metadata)
+        tags = meta.get("tags", [])
+        if isinstance(tags, list):
+            # Task categories tell us what the benchmark does
+            for tag in tags:
+                if isinstance(tag, str) and tag.startswith("task_categories:"):
+                    signals.append(tag.split(":", 1)[1].strip().replace("-", " "))
+            # Standalone tags (domains)
+            for tag in tags:
+                if isinstance(tag, str) and ":" not in tag and len(tag) > 2:
+                    signals.append(tag.replace("-", " "))
+
+        # card_data pretty_name or dataset_summary
+        card_data = meta.get("card_data", {})
+        if isinstance(card_data, dict):
+            summary = card_data.get("dataset_summary", "")
+            if summary and len(summary) < 300:
+                signals.append(summary)
+
+        # HF description field (short)
+        desc = meta.get("description", "")
+        if desc and len(desc) < 200:
+            signals.append(desc)
+
+    if not signals:
         return ""
 
-    # Format sources compactly
-    hf_text = "Not available"
-    if hf_metadata:
-        hf_compact = _compact_hf_metadata(hf_metadata) if isinstance(hf_metadata, dict) else {}
-        hf_text = json.dumps(hf_compact, indent=2) if hf_compact else "Not available"
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for s in signals:
+        sl = s.lower().strip()
+        if sl not in seen and sl:
+            seen.add(sl)
+            unique.append(s.strip())
 
-    ids_text = json.dumps(extracted_ids, indent=2) if extracted_ids else "Not available"
-
-    # Build sources list dynamically — only include available sources
-    source_parts = [f"1. PAPER CONTENT:\n{paper_content}"]
-    source_parts.append(f"2. HuggingFace Dataset:\n{hf_text}")
-
-    source_idx = 3
-    if unitxt_metadata:
-        unitxt_text = json.dumps(unitxt_metadata, indent=2)
-        source_parts.append(f"{source_idx}. UnitXT Catalog:\n{unitxt_text}")
-        source_idx += 1
-
-    source_parts.append(f"{source_idx}. Extracted IDs:\n{ids_text}")
-    source_idx += 1
-
-    if eee_metadata:
-        eee_compact = _compact_eee_metadata(eee_metadata)
-        eee_text = json.dumps(eee_compact, indent=2) if eee_compact else "Not available"
-        source_parts.append(f"{source_idx}. Every Eval Ever (EEE) Evaluation Data:\n{eee_text}")
-
-    sources = "\n\n".join(source_parts)
-
-    user_message = (
-        f"Benchmark: {query}\n\n"
-        f"SOURCES:\n\n"
-        f"{sources}\n\n"
-        f"---\n\n"
-        f"{extraction_prompt}\n"
-        f"Return facts as short bullet points per field. Only include what the sources explicitly state."
+    identity = ", ".join(unique[:6])
+    return (
+        f'BENCHMARK IDENTITY: "{benchmark_name}" is about: {identity}. '
+        f"Only extract facts that are relevant to this topic."
     )
 
-    prompt = f"{_EXTRACTOR_SYSTEM}\n\n{user_message}"
 
-    try:
-        light_llm = get_light_llm_handler()
-        facts = light_llm.generate(prompt)
-        logger.debug("Extracted facts for %s (%d chars)", section_name, len(facts))
-        return facts
-    except Exception as e:
-        logger.warning("Fact extraction failed for %s: %s — composer will use raw sources", section_name, e)
+# ---------------------------------------------------------------------------
+# Source-isolated extraction functions
+# ---------------------------------------------------------------------------
+
+def extract_facts_from_paper(
+    paper_content: str, benchmark_name: str, identity_anchor: str = ""
+) -> str:
+    """Extract facts from paper text using heavy model. Source-isolated.
+
+    Only the paper text is provided — no HF, EEE, or other sources.
+    This prevents cross-contamination between sources.
+    """
+    if not paper_content or paper_content == "Not available":
         return ""
 
+    prompt = PAPER_EXTRACTION_PROMPT.format(
+        benchmark_name=benchmark_name,
+        paper_content=paper_content,
+        identity_anchor=identity_anchor,
+    )
+
+    try:
+        from auto_benchmarkcard.config import get_llm_handler
+        llm_handler = get_llm_handler()
+        facts = llm_handler.generate(f"{_EXTRACTOR_SYSTEM}\n\n{prompt}")
+        logger.info("Paper extraction: %d chars of facts", len(facts))
+        return facts
+    except Exception as e:
+        logger.warning("Paper fact extraction failed: %s", e)
+        return ""
+
+
+def extract_facts_from_hf_readme(
+    hf_metadata: Dict[str, Any],
+    benchmark_name: str,
+    hf_retriever: Any = None,
+    identity_anchor: str = "",
+) -> str:
+    """Extract facts from HF README using heavy model. Source-isolated.
+
+    Only the HF README is provided — no paper or EEE data.
+    For large READMEs (>4000 chars), uses RAG retrieval for comprehensive coverage.
+    """
+    readme = _get_hf_readme(hf_metadata)
+    if not readme or len(readme) < 100:
+        return ""
+
+    # For large READMEs, use RAG-retrieved chunks for better coverage
+    if hf_retriever and len(readme) > 4000:
+        seen = set()
+        all_chunks = []
+        for queries in SECTION_QUERIES.values():
+            for sq in queries:
+                try:
+                    for chunk in hf_retriever.invoke(sq):
+                        key = chunk.page_content[:200]
+                        if key not in seen:
+                            seen.add(key)
+                            all_chunks.append(chunk)
+                except Exception:
+                    pass
+
+        if all_chunks:
+            budget = 8000
+            used = 0
+            parts = []
+            for chunk in all_chunks:
+                text = chunk.page_content
+                if used + len(text) > budget:
+                    remaining = budget - used
+                    if remaining > 100:
+                        parts.append(text[:remaining])
+                    break
+                parts.append(text)
+                used += len(text)
+            hf_content = "\n\n".join(parts)
+            logger.info("HF README: %d RAG chunks, %d chars for extraction", len(all_chunks), used)
+        else:
+            hf_content = readme[:8000]
+    else:
+        # Short READMEs: use full text (no truncation for reasonable sizes)
+        hf_content = readme[:8000]
+
+    prompt = HF_README_EXTRACTION_PROMPT.format(
+        benchmark_name=benchmark_name,
+        hf_content=hf_content,
+        identity_anchor=identity_anchor,
+    )
+
+    try:
+        from auto_benchmarkcard.config import get_llm_handler
+        llm_handler = get_llm_handler()
+        facts = llm_handler.generate(f"{_EXTRACTOR_SYSTEM}\n\n{prompt}")
+        logger.info("HF README extraction: %d chars of facts (from %d chars source)", len(facts), len(hf_content))
+        return facts
+    except Exception as e:
+        logger.warning("HF README fact extraction failed: %s", e)
+        return ""
+
+
+def _get_hf_readme(hf_metadata: Optional[Dict[str, Any]]) -> str:
+    """Get README text from HF metadata, handling nested structures."""
+    if not hf_metadata or not isinstance(hf_metadata, dict):
+        return ""
+    readme = hf_metadata.get("readme_markdown", "")
+    if not readme:
+        for v in hf_metadata.values():
+            if isinstance(v, dict):
+                readme = v.get("readme_markdown", "")
+                if readme:
+                    break
+    return readme
+
+
+def _get_hf_meta(hf_metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Navigate to the actual HF metadata dict (may be nested by dataset ID)."""
+    if not hf_metadata or not isinstance(hf_metadata, dict):
+        return {}
+    if "tags" in hf_metadata:
+        return hf_metadata
+    for v in hf_metadata.values():
+        if isinstance(v, dict) and "tags" in v:
+            return v
+    return hf_metadata
+
+
+# ---------------------------------------------------------------------------
+# Deterministic extraction (no LLM)
+# ---------------------------------------------------------------------------
+
+def extract_deterministic_facts(
+    eee_metadata: Optional[Dict[str, Any]] = None,
+    hf_metadata: Optional[Dict[str, Any]] = None,
+    extracted_ids: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Extract facts from structured sources without LLM.
+
+    Returns a dict mapping field paths (e.g., 'methodology.metrics') to values.
+    These are ground-truth values that should override LLM-generated content.
+    """
+    facts: Dict[str, Any] = {}
+
+    # --- From HF metadata ---
+    if hf_metadata:
+        meta = _get_hf_meta(hf_metadata)
+        tags = meta.get("tags", [])
+        if isinstance(tags, list):
+            # Languages
+            languages = []
+            for tag in tags:
+                if isinstance(tag, str) and tag.startswith("language:"):
+                    code = tag.split(":", 1)[1].strip()
+                    languages.append(LANG_MAP.get(code, code))
+            if languages:
+                facts["benchmark_details.languages"] = languages
+
+            # License
+            for tag in tags:
+                if isinstance(tag, str) and tag.startswith("license:"):
+                    facts["ethical_and_legal_considerations.data_licensing"] = tag.split(":", 1)[1].strip()
+                    break
+
+            # Size category
+            for tag in tags:
+                if isinstance(tag, str) and tag.startswith("size_categories:"):
+                    facts["data.size_category"] = tag.split(":", 1)[1].strip()
+                    break
+
+            # Format
+            for tag in tags:
+                if isinstance(tag, str) and tag.startswith("format:"):
+                    facts["data.format"] = tag.split(":", 1)[1].strip()
+                    break
+
+            # Task categories
+            task_cats = []
+            for tag in tags:
+                if isinstance(tag, str) and tag.startswith("task_categories:"):
+                    task_cats.append(tag.split(":", 1)[1].strip().replace("-", " "))
+            if task_cats:
+                facts["purpose_and_intended_users.tasks_hf"] = task_cats
+
+            # Domain/subject area from tags (annotation, region, etc.)
+            domain_tags = []
+            for tag in tags:
+                if isinstance(tag, str) and ":" not in tag and len(tag) > 2:
+                    # Standalone tags often indicate domains
+                    domain_tags.append(tag.replace("-", " "))
+            if domain_tags:
+                facts["benchmark_details.domain_tags"] = domain_tags
+
+        # License from top-level or card_data
+        if "ethical_and_legal_considerations.data_licensing" not in facts:
+            license_val = meta.get("license")
+            if not license_val:
+                card_data = meta.get("card_data", {})
+                if isinstance(card_data, dict):
+                    license_val = card_data.get("license")
+            if license_val:
+                facts["ethical_and_legal_considerations.data_licensing"] = license_val
+
+        # HF description (short summary from card_data or description field)
+        card_data = meta.get("card_data", {})
+        if isinstance(card_data, dict):
+            # Dataset summary from YAML frontmatter
+            pretty_name = card_data.get("pretty_name", "")
+            if pretty_name:
+                facts["benchmark_details.pretty_name"] = pretty_name
+            # Annotations creators
+            annot_creators = card_data.get("annotations_creators", [])
+            if annot_creators and isinstance(annot_creators, list):
+                facts["data.annotation_creators"] = [
+                    c.replace("-", " ") for c in annot_creators
+                ]
+            # Source datasets
+            source_datasets = card_data.get("source_datasets", [])
+            if source_datasets and isinstance(source_datasets, list):
+                facts["data.source_datasets"] = source_datasets
+
+        # Dataset size from dataset_info if available
+        dataset_info = meta.get("dataset_info", {})
+        if isinstance(dataset_info, dict):
+            splits = dataset_info.get("splits", [])
+            if isinstance(splits, list) and splits:
+                split_info = []
+                total = 0
+                for s in splits:
+                    if isinstance(s, dict) and "name" in s and "num_examples" in s:
+                        split_info.append(f"{s['name']}: {s['num_examples']}")
+                        total += s.get("num_examples", 0)
+                if split_info:
+                    facts["data.split_info"] = split_info
+                    facts["data.total_examples"] = total
+
+    # --- From EEE metadata ---
+    if eee_metadata:
+        metrics = eee_metadata.get("metrics", {})
+        if metrics:
+            facts["methodology.metrics"] = list(metrics.keys())
+            facts["methodology.metric_configs"] = {
+                name: {
+                    "lower_is_better": cfg.get("lower_is_better", False),
+                    "score_type": cfg.get("score_type", ""),
+                    "description": cfg.get("evaluation_description", ""),
+                }
+                for name, cfg in list(metrics.items())[:10]
+            }
+
+        eval_summary = eee_metadata.get("evaluation_summary", {})
+        if eval_summary:
+            facts["evaluation_summary"] = eval_summary
+
+        source_urls = eee_metadata.get("source_urls", [])
+        if source_urls:
+            facts["benchmark_details.eee_source_urls"] = source_urls[:5]
+
+        if eee_metadata.get("eval_library"):
+            facts["methodology.eval_library"] = eee_metadata["eval_library"]
+
+    # --- From extracted IDs ---
+    if extracted_ids:
+        if extracted_ids.get("paper_url"):
+            facts["benchmark_details.paper_url"] = extracted_ids["paper_url"]
+        if extracted_ids.get("hf_repo"):
+            hf_repo = extracted_ids["hf_repo"]
+            facts["benchmark_details.hf_url"] = f"https://huggingface.co/datasets/{hf_repo}"
+
+    logger.info("Deterministic facts: %d fields extracted", len(facts))
+    return facts
+
+
+# ---------------------------------------------------------------------------
+# Lightweight contamination check
+# ---------------------------------------------------------------------------
+
+def check_cross_contamination(
+    extracted_facts: str,
+    source_text: str,
+    benchmark_name: str,
+    identity_anchor: str = "",
+) -> str:
+    """Lightweight check for cross-benchmark contamination.
+
+    Two-layer check:
+    1. Proper-noun check: flags lines with specific names not in source text
+    2. Topic-mismatch check: flags lines whose topic contradicts the benchmark identity
+       (e.g., "math word problems" for an instruction-following benchmark)
+
+    Does NOT check numbers (which caused false positives with normalized forms like
+    8.5K vs 8500). Only checks 4+ char proper nouns that don't appear in source text.
+    """
+    if not extracted_facts or not source_text:
+        return extracted_facts
+
+    source_lower = source_text.lower()
+
+    # Build topic keywords from the identity anchor for topic-mismatch detection
+    # e.g., identity "IFEval is about: text generation, instruction following"
+    # → topic_keywords = {"text generation", "instruction following"}
+    topic_keywords: set = set()
+    if identity_anchor:
+        # Extract the "is about:" portion
+        about_match = re.search(r'is about:\s*(.+?)\.?\s*Only', identity_anchor)
+        if about_match:
+            topics = about_match.group(1).split(",")
+            topic_keywords = {t.strip().lower() for t in topics if t.strip()}
+
+    # Build off-topic indicators: common benchmark-specific terms that
+    # indicate a DIFFERENT benchmark's topic area
+    _TOPIC_CLASH_PAIRS = {
+        # If benchmark is about these topics → these phrases are off-topic
+        "instruction following": [
+            "math word problem", "grade school math", "arithmetic",
+            "mathematical reasoning", "solving math",
+        ],
+        "text generation": [],
+        "evaluation": [],
+        "mathematics": [
+            "instruction following", "instruction-following",
+        ],
+        "grade school math": [
+            "instruction following", "instruction-following",
+        ],
+        "question answering": [
+            "math word problem", "grade school math",
+        ],
+    }
+
+    off_topic_phrases: list = []
+    for topic in topic_keywords:
+        for key, phrases in _TOPIC_CLASH_PAIRS.items():
+            if key in topic:
+                off_topic_phrases.extend(phrases)
+
+    result_lines = []
+    flagged_count = 0
+
+    for line in extracted_facts.split("\n"):
+        stripped = line.strip()
+
+        # Keep non-fact lines (headers, empty, "no information found")
+        if (not stripped or stripped.startswith("#") or
+                "no information found" in stripped.lower() or
+                not stripped.startswith("-")):
+            result_lines.append(line)
+            continue
+
+        # --- Layer 1: Topic-mismatch check ---
+        line_lower = stripped.lower()
+        topic_clash = False
+        for phrase in off_topic_phrases:
+            if phrase in line_lower and phrase not in source_lower:
+                flagged_count += 1
+                result_lines.append(
+                    f"{line} [SUSPECT: topic '{phrase}' doesn't match benchmark domain]"
+                )
+                topic_clash = True
+                break
+        if topic_clash:
+            continue
+
+        # --- Layer 2: Proper-noun check ---
+        # Extract proper nouns — platforms, tools, organizations, benchmarks
+        cap_words = re.findall(r'\b[A-Z][A-Za-z0-9]{3,}(?:[-_][A-Za-z0-9]+)*\b', stripped)
+        # Filter common English words that happen to be capitalized
+        common = {
+            "the", "this", "that", "not", "for", "and", "are", "was",
+            "has", "its", "each", "what", "how", "who", "all", "use",
+            "can", "may", "any", "set", "one", "two", "per", "new",
+            "text", "data", "model", "task", "test", "used", "based",
+            "from", "also", "with", "into", "they", "than", "more",
+            "most", "only", "some", "such", "been", "were", "have",
+            "does", "make", "made", "like", "using", "these", "those",
+            "about", "other", "their", "there", "which", "would",
+            "could", "should", "being", "after", "before", "paper",
+            "level", "score", "high", "note", "type", "human",
+            "found", "total", "each", "free", "full", "large",
+            "small", "first", "second", "third", "final", "main",
+            "true", "false", "null", "none", "english", "information",
+        }
+        cap_words = [w for w in cap_words if w.lower() not in common]
+
+        # Also exclude the benchmark name itself and common ML terms
+        ml_terms = {"accuracy", "precision", "recall", "bleu", "rouge",
+                     "transformer", "language", "neural", "training",
+                     "evaluation", "benchmark", "dataset", "annotation"}
+        cap_words = [w for w in cap_words if (
+            w.lower() not in ml_terms and
+            w.lower() not in benchmark_name.lower()
+        )]
+
+        # Check: do these proper nouns appear in the source text?
+        suspicious_words = []
+        for w in cap_words:
+            if w.lower() not in source_lower:
+                suspicious_words.append(w)
+
+        # Only flag if we found 2+ unverifiable proper nouns in one line,
+        # OR 1 very specific one (platform name pattern: ends in AI, starts with capital)
+        if len(suspicious_words) >= 2:
+            flagged_count += 1
+            result_lines.append(f"{line} [SUSPECT: terms '{', '.join(suspicious_words)}' not found in source]")
+            continue
+        elif len(suspicious_words) == 1:
+            w = suspicious_words[0]
+            # High-signal names: likely platform/org names (Upwork, Surge, etc.)
+            if len(w) >= 5 and w[0].isupper() and w[1:].islower():
+                flagged_count += 1
+                result_lines.append(f"{line} [SUSPECT: '{w}' not found in source]")
+                continue
+
+        result_lines.append(line)
+
+    if flagged_count:
+        logger.info("Contamination check: flagged %d potentially cross-contaminated facts for '%s'",
+                     flagged_count, benchmark_name)
+    return "\n".join(result_lines)
+
+
+# ---------------------------------------------------------------------------
+# Gap-filling: targeted retrieval for missing fields
+# ---------------------------------------------------------------------------
+
+# Targeted queries for specific fields that are commonly missed
+_GAP_QUERIES = {
+    "domains": "domain area subject field topic application area research discipline",
+    "limitations": "limitation weakness constraint bias shortcoming caveat",
+    "annotation": "annotation annotator label crowdworker human judge agreement quality control",
+    "source": "data collection source origin corpus created gathered compiled",
+    "similar_benchmarks": "related work comparison benchmark dataset alternative prior",
+    "audience": "intended user researcher practitioner developer community",
+    "out_of_scope_uses": "not designed for out of scope limitation inappropriate use",
+    "consent_procedures": "crowdworker consent compensation IRB ethical approval platform",
+    "methods": "evaluation method zero-shot few-shot fine-tune prompt protocol",
+    "baseline_results": "baseline result score performance accuracy model evaluation",
+    "calculation": "overall score calculation aggregate average weighted macro",
+}
+
+
+def _fill_paper_gaps(
+    paper_facts: str,
+    paper_retriever: Any,
+    benchmark_name: str,
+    full_paper_text: str,
+) -> str:
+    """Targeted retrieval for fields where first-pass extraction found nothing.
+
+    Identifies "No information found" fields, retrieves paper chunks with
+    field-specific queries, and attempts a focused extraction for those fields only.
+    """
+    # Find which fields have "No information found"
+    missing_fields = []
+    current_section = ""
+    for line in paper_facts.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            current_section = stripped[3:].strip()
+        elif stripped.startswith("- ") and "no information found" in stripped.lower():
+            # Extract field name: "- domains: No information found" → "domains"
+            field_match = re.match(r'-\s*(\w+):', stripped)
+            if field_match:
+                field_name = field_match.group(1)
+                if field_name in _GAP_QUERIES:
+                    missing_fields.append((current_section, field_name))
+
+    if not missing_fields:
+        return paper_facts
+
+    logger.info("Gap-filling: attempting targeted retrieval for %d missing fields: %s",
+                len(missing_fields), [f[1] for f in missing_fields])
+
+    # Retrieve targeted chunks for each missing field
+    gap_chunks: Dict[str, str] = {}
+    for section, field in missing_fields:
+        query = _GAP_QUERIES[field]
+        try:
+            chunks = paper_retriever.invoke(query)
+            if chunks:
+                # Take top 2 chunks, max 1500 chars
+                text = "\n".join(c.page_content for c in chunks[:2])[:1500]
+                gap_chunks[field] = text
+        except Exception:
+            pass
+
+    if not gap_chunks:
+        return paper_facts
+
+    # Build a focused extraction prompt for just the missing fields
+    fields_text = "\n".join(
+        f"- {field}: Extract this information from the text below."
+        for _, field in missing_fields
+        if field in gap_chunks
+    )
+    chunks_text = "\n\n".join(
+        f"[For {field}]\n{text}" for field, text in gap_chunks.items()
+    )
+
+    gap_prompt = f"""Read the following paper excerpts about the benchmark "{benchmark_name}" and describe what they say about these specific fields.
+
+RULES: Base your descriptions ONLY on the text provided. Rephrase in your own words. If the text does not contain the information, write: "- No information found"
+
+Fields to describe:
+{fields_text}
+
+PAPER EXCERPTS:
+{chunks_text}"""
+
+    try:
+        from auto_benchmarkcard.config import get_llm_handler
+        llm_handler = get_llm_handler()
+        gap_facts = llm_handler.generate(f"{_EXTRACTOR_SYSTEM}\n\n{gap_prompt}")
+
+        # Merge gap-filled facts back into original
+        filled_count = 0
+        for _, field in missing_fields:
+            # Find the gap-filled line for this field
+            pattern = rf'-\s*{field}:\s*(.+)'
+            match = re.search(pattern, gap_facts, re.IGNORECASE)
+            if match and "no information found" not in match.group(1).lower():
+                new_value = match.group(0)
+                # Replace the "No information found" line in original
+                old_pattern = rf'(-\s*{field}:\s*.*[Nn]o information found.*)'
+                paper_facts = re.sub(old_pattern, new_value, paper_facts)
+                filled_count += 1
+
+        if filled_count:
+            logger.info("Gap-filling: filled %d/%d missing fields", filled_count, len(missing_fields))
+        else:
+            logger.info("Gap-filling: no additional facts found in paper")
+
+    except Exception as e:
+        logger.warning("Gap-filling extraction failed: %s", e)
+
+    return paper_facts
+
+
+# ---------------------------------------------------------------------------
+# Fact merging
+# ---------------------------------------------------------------------------
+
+def merge_extracted_facts(
+    paper_facts: str,
+    hf_facts: str,
+    deterministic_facts: Dict[str, Any],
+    benchmark_name: str,
+) -> Dict[str, str]:
+    """Merge facts from all sources with source tags.
+
+    Returns dict mapping section_name → tagged facts string for composition.
+    Priority: [DETERMINISTIC] > [PAPER] > [HF_README]
+    """
+    merged: Dict[str, str] = {}
+
+    for section in ALL_SECTIONS:
+        parts = []
+
+        # Paper facts
+        if paper_facts:
+            section_text = _extract_section_from_facts(paper_facts, section)
+            if section_text:
+                parts.append(f"[PAPER] Facts from research paper:\n{section_text}")
+
+        # HF README facts
+        if hf_facts:
+            section_text = _extract_section_from_facts(hf_facts, section)
+            if section_text:
+                parts.append(f"[HF_README] Facts from HuggingFace dataset page:\n{section_text}")
+
+        # Deterministic facts
+        det_lines = []
+        for key, value in deterministic_facts.items():
+            if key.startswith(section + "."):
+                field = key.split(".", 1)[1]
+                if isinstance(value, list):
+                    det_lines.append(f"- {field}: {', '.join(str(v) for v in value)}")
+                elif isinstance(value, dict):
+                    det_lines.append(f"- {field}: {json.dumps(value)}")
+                else:
+                    det_lines.append(f"- {field}: {value}")
+
+        if det_lines:
+            parts.append(
+                "[DETERMINISTIC] Verified facts from structured metadata:\n"
+                + "\n".join(det_lines)
+            )
+
+        # EEE evaluation results for methodology section
+        if section == "methodology" and "evaluation_summary" in deterministic_facts:
+            eval_sum = deterministic_facts["evaluation_summary"]
+            eee_lines = []
+            for p in eval_sum.get("top_performers", [])[:5]:
+                metric = eval_sum.get("primary_metric", "score")
+                eee_lines.append(f"- {p['model']}: {p['score']:.4f} ({metric})")
+            stats = eval_sum.get("score_statistics", {})
+            if stats:
+                eee_lines.append(
+                    f"- Score statistics: mean={stats.get('mean')}, "
+                    f"std={stats.get('std_dev')}, "
+                    f"range=[{stats.get('min')}, {stats.get('max')}]"
+                )
+            n = eval_sum.get("total_models_evaluated", 0)
+            if n:
+                eee_lines.append(f"- Total models evaluated: {n}")
+            if eee_lines:
+                parts.append(
+                    "[EEE] Evaluation results from Every Eval Ever:\n"
+                    + "\n".join(eee_lines)
+                )
+
+        merged[section] = "\n\n".join(parts) if parts else "No facts available for this section."
+
+    return merged
+
+
+def _extract_section_from_facts(facts_text: str, section_name: str) -> str:
+    """Extract facts for a specific section from the full LLM extraction output."""
+    section_variants = [
+        f"## {section_name}",
+        f"## {section_name.replace('_', ' ')}",
+        f"## {section_name.replace('_', ' ').title()}",
+        f"**{section_name}**",
+        f"**{section_name.replace('_', ' ').title()}**",
+    ]
+
+    lines = facts_text.split("\n")
+    collecting = False
+    collected = []
+
+    for line in lines:
+        stripped = line.strip().lower()
+
+        # Check if this line starts our target section
+        if any(v.lower() in stripped for v in section_variants):
+            collecting = True
+            continue
+
+        # Check if we've hit another section
+        if collecting and (stripped.startswith("## ") or
+                           (stripped.startswith("**") and stripped.endswith("**"))):
+            is_other = any(
+                s.replace("_", " ").lower() in stripped
+                for s in ALL_SECTIONS if s != section_name
+            )
+            if is_other:
+                break
+
+        if collecting:
+            collected.append(line)
+
+    result = "\n".join(collected).strip()
+
+    # Remove [UNVERIFIED] and [SUSPECT] lines
+    if result:
+        clean = [l for l in result.split("\n")
+                 if "[UNVERIFIED]" not in l and "[SUSPECT]" not in l]
+        result = "\n".join(clean).strip()
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Post-processing and validation
+# ---------------------------------------------------------------------------
+
+def post_process_card(card: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply schema fixes and validations to the generated card."""
+    bd = card.get("benchmark_details", {})
+
+    # similar_benchmarks: always a list, no hallucinated entries
+    sb = bd.get("similar_benchmarks", [])
+    if isinstance(sb, str):
+        if any(neg in sb.lower() for neg in ["no ", "not ", "none", "no similar"]):
+            bd["similar_benchmarks"] = []
+        else:
+            bd["similar_benchmarks"] = [sb]
+
+    # resources: validate URLs, expand HF repo IDs, fix typos
+    resources = bd.get("resources", [])
+    if isinstance(resources, list):
+        clean = []
+        seen = set()
+        for r in resources:
+            if not isinstance(r, str):
+                continue
+            # Expand bare HF repo IDs (e.g., "cais/mmlu")
+            if "/" in r and not r.startswith("http") and not r.startswith("ftp"):
+                r = f"https://huggingface.co/datasets/{r}"
+            # Fix common typos
+            r = r.replace("hugdingface.co", "huggingface.co")
+            # Only keep valid URLs
+            if r.startswith("http") and r not in seen:
+                clean.append(r)
+                seen.add(r)
+        bd["resources"] = clean
+
+    # languages: normalize codes to full names
+    languages = bd.get("languages", [])
+    if isinstance(languages, list):
+        bd["languages"] = [LANG_MAP.get(l, l) for l in languages]
+    card["benchmark_details"] = bd
+
+    # out_of_scope_uses: always a list
+    purpose = card.get("purpose_and_intended_users", {})
+    osu = purpose.get("out_of_scope_uses", [])
+    if isinstance(osu, str):
+        if any(neg in osu.lower() for neg in ["no ", "not ", "none"]):
+            purpose["out_of_scope_uses"] = []
+        else:
+            purpose["out_of_scope_uses"] = [osu]
+    card["purpose_and_intended_users"] = purpose
+
+    # Ensure structural keys exist
+    if "flagged_fields" not in card:
+        card["flagged_fields"] = {}
+    if "missing_fields" not in card:
+        card["missing_fields"] = []
+
+    return card
+
+
+def apply_deterministic_overrides(
+    card: Dict[str, Any],
+    deterministic_facts: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Override LLM-generated fields with deterministic values where available.
+
+    These are ground-truth values from structured sources (EEE, HF tags)
+    that should always take precedence over LLM-generated content.
+    """
+    overrides_applied = []
+
+    # Override metrics from EEE
+    if "methodology.metrics" in deterministic_facts:
+        eee_metrics = deterministic_facts["methodology.metrics"]
+        if eee_metrics and card.get("methodology"):
+            card["methodology"]["metrics"] = eee_metrics
+            overrides_applied.append("metrics")
+
+    # Override languages from HF
+    if "benchmark_details.languages" in deterministic_facts:
+        card.setdefault("benchmark_details", {})["languages"] = \
+            deterministic_facts["benchmark_details.languages"]
+        overrides_applied.append("languages")
+
+    # Override license from HF
+    if "ethical_and_legal_considerations.data_licensing" in deterministic_facts:
+        card.setdefault("ethical_and_legal_considerations", {})["data_licensing"] = \
+            deterministic_facts["ethical_and_legal_considerations.data_licensing"]
+        overrides_applied.append("license")
+
+    # Override format from HF
+    if "data.format" in deterministic_facts:
+        card.setdefault("data", {})["format"] = deterministic_facts["data.format"]
+        overrides_applied.append("format")
+
+    # Enrich resources with deterministic URLs
+    resources = card.get("benchmark_details", {}).get("resources", [])
+    urls_added = []
+    if "benchmark_details.paper_url" in deterministic_facts:
+        url = deterministic_facts["benchmark_details.paper_url"]
+        if url and url not in resources:
+            resources.insert(0, url)
+            urls_added.append("paper")
+    if "benchmark_details.hf_url" in deterministic_facts:
+        url = deterministic_facts["benchmark_details.hf_url"]
+        if url and url not in resources:
+            resources.append(url)
+            urls_added.append("hf")
+    if "benchmark_details.eee_source_urls" in deterministic_facts:
+        for url in deterministic_facts["benchmark_details.eee_source_urls"]:
+            if url and url not in resources:
+                resources.append(url)
+                urls_added.append("eee")
+    card.setdefault("benchmark_details", {})["resources"] = resources
+    if urls_added:
+        overrides_applied.append(f"resources({','.join(urls_added)})")
+
+    if overrides_applied:
+        logger.info("Deterministic overrides applied: %s", ", ".join(overrides_applied))
+
+    return card
+
+
+def compute_card_confidence(
+    has_paper: bool,
+    has_hf_readme: bool,
+    has_eee: bool,
+    has_hf_basic: bool = False,
+) -> Dict[str, Any]:
+    """Compute card-level confidence metadata based on available sources."""
+    if has_paper and (has_hf_readme or has_hf_basic):
+        level = "high"
+    elif has_paper or (has_hf_readme and has_eee):
+        level = "medium"
+    else:
+        level = "low"
+
+    return {
+        "confidence_level": level,
+        "sources_available": {
+            "paper": has_paper,
+            "hf_readme": has_hf_readme,
+            "hf_basic_metadata": has_hf_basic,
+            "eee": has_eee,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Helper: compact metadata for fallback composition
+# ---------------------------------------------------------------------------
 
 def _compact_hf_metadata(hf_metadata: Dict[str, Any]) -> Dict[str, Any]:
     """Extract only the fields useful for composition from HF metadata."""
-    meta = hf_metadata
-    if "tags" not in meta:
-        for v in meta.values():
-            if isinstance(v, dict) and "tags" in v:
-                meta = v
-                break
+    meta = _get_hf_meta(hf_metadata)
 
     compact: Dict[str, Any] = {}
     for key in ("id", "tags", "license", "downloads", "likes"):
@@ -231,7 +1098,6 @@ def _compact_eee_metadata(eee_metadata: Dict[str, Any]) -> Dict[str, Any]:
     if eee_metadata.get("source_urls"):
         compact["source_urls"] = eee_metadata["source_urls"][:5]
 
-    # Include metrics info
     metrics = eee_metadata.get("metrics", {})
     if metrics:
         compact["metrics"] = {
@@ -243,7 +1109,6 @@ def _compact_eee_metadata(eee_metadata: Dict[str, Any]) -> Dict[str, Any]:
             for k, v in list(metrics.items())[:10]
         }
 
-    # Include evaluation summary (top performers, stats)
     eval_summary = eee_metadata.get("evaluation_summary", {})
     if eval_summary:
         compact["evaluation_summary"] = {
@@ -256,19 +1121,12 @@ def _compact_eee_metadata(eee_metadata: Dict[str, Any]) -> Dict[str, Any]:
     return compact
 
 
-# schema for the benchmark card
-class BenchmarkDetails(BaseModel):
-    """Basic identifying information about a benchmark.
+# ---------------------------------------------------------------------------
+# Pydantic schema for the benchmark card
+# ---------------------------------------------------------------------------
 
-    Attributes:
-        name: The official name of the benchmark as it appears in literature.
-        overview: A comprehensive 2-3 sentence description explaining what the benchmark measures.
-        data_type: The primary data modality (e.g., text, image, audio, multimodal, tabular).
-        domains: Specific application domains or subject areas.
-        languages: All languages supported in the dataset using full language names.
-        similar_benchmarks: Names of closely related or comparable benchmarks.
-        resources: URLs to official papers, datasets, leaderboards, and documentation.
-    """
+class BenchmarkDetails(BaseModel):
+    """Basic identifying information about a benchmark."""
 
     name: str = Field(
         ...,
@@ -305,15 +1163,7 @@ class BenchmarkDetails(BaseModel):
 
 
 class PurposeAndIntendedUsers(BaseModel):
-    """Purpose, target users, and use case information.
-
-    Attributes:
-        goal: The primary objective and research question this benchmark addresses.
-        audience: Target user groups for the benchmark.
-        tasks: Specific evaluation tasks or subtasks the benchmark covers.
-        limitations: Known limitations, biases, or constraints of the benchmark.
-        out_of_scope_uses: Explicit examples of inappropriate or unsupported use cases.
-    """
+    """Purpose, target users, and use case information."""
 
     goal: str = Field(
         ...,
@@ -342,14 +1192,7 @@ class PurposeAndIntendedUsers(BaseModel):
 
 
 class DataInfo(BaseModel):
-    """Information about dataset composition and collection.
-
-    Attributes:
-        source: Detailed information about data origins and collection methods.
-        size: Dataset size with specific numbers.
-        format: Data structure, file formats, and organization.
-        annotation: Annotation methodology and quality control measures.
-    """
+    """Information about dataset composition and collection."""
 
     source: str = Field(
         ...,
@@ -377,16 +1220,7 @@ class DataInfo(BaseModel):
 
 
 class Methodology(BaseModel):
-    """Evaluation methodology and metric specifications.
-
-    Attributes:
-        methods: Evaluation approaches and techniques applied.
-        metrics: Specific quantitative metrics used.
-        calculation: Detailed explanation of metric computation.
-        interpretation: Guidelines for interpreting scores.
-        baseline_results: Performance of established models or baselines.
-        validation: Quality assurance measures and validation procedures.
-    """
+    """Evaluation methodology and metric specifications."""
 
     methods: List[str] = Field(
         ...,
@@ -419,14 +1253,7 @@ class Methodology(BaseModel):
 
 
 class EthicalAndLegalConsiderations(BaseModel):
-    """Ethical and legal aspects of the benchmark.
-
-    Attributes:
-        privacy_and_anonymity: Data protection and anonymization measures.
-        data_licensing: License terms and usage restrictions.
-        consent_procedures: Informed consent processes and participant rights.
-        compliance_with_regulations: Adherence to relevant regulations and ethical reviews.
-    """
+    """Ethical and legal aspects of the benchmark."""
 
     privacy_and_anonymity: str = Field(
         ...,
@@ -451,15 +1278,7 @@ class EthicalAndLegalConsiderations(BaseModel):
 
 
 class BenchmarkCard(BaseModel):
-    """Complete benchmark card structure.
-
-    Attributes:
-        benchmark_details: Basic identifying information.
-        purpose_and_intended_users: Purpose and target user information.
-        data: Dataset composition and collection details.
-        methodology: Evaluation methodology and metrics.
-        ethical_and_legal_considerations: Ethical and legal aspects.
-    """
+    """Complete benchmark card structure."""
 
     benchmark_details: BenchmarkDetails
     purpose_and_intended_users: PurposeAndIntendedUsers
@@ -469,19 +1288,15 @@ class BenchmarkCard(BaseModel):
 
 
 def extract_provenance(section_data: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
-    """Extract provenance from section data, returning clean data and provenance separately.
-
-    Args:
-        section_data: Section dictionary that may contain a 'provenance' field.
-
-    Returns:
-        Tuple of (clean_section_data without provenance, provenance_data).
-    """
-    # Make a copy to avoid mutating the original
+    """Extract provenance from section data, returning clean data and provenance separately."""
     clean_data = dict(section_data)
     provenance = clean_data.pop("provenance", None) or {}
     return clean_data, provenance
 
+
+# ---------------------------------------------------------------------------
+# Main composition function
+# ---------------------------------------------------------------------------
 
 @tool("compose_benchmark_card")
 def compose_benchmark_card(
@@ -494,43 +1309,46 @@ def compose_benchmark_card(
 ) -> Dict[str, Any]:
     """Compose a benchmark card from all the metadata we collected.
 
-    Args:
-        unitxt_metadata: Optional metadata from UnitXT catalog.
-        hf_metadata: Optional metadata from HuggingFace.
-        extracted_ids: Optional extracted identifier information.
-        docling_output: Optional extracted paper content.
-        query: Original query string for context.
-        eee_metadata: Optional metadata from Every Eval Ever (EEE).
-
-    Returns:
-        Dictionary containing composed benchmark card and composition metadata.
+    Uses source-isolated extraction to prevent cross-contamination:
+    1. Extract facts from paper ONLY (1 LLM call)
+    2. Extract facts from HF README ONLY (1 LLM call)
+    3. Extract deterministic facts from EEE/HF tags (no LLM)
+    4. Verify paper facts against paper text
+    5. Merge all facts with source tags
+    6. Compose each section from tagged facts (5 LLM calls)
+    7. Apply deterministic overrides
+    8. Post-process for schema consistency
     """
 
-    logger.debug(f"Composing benchmark card for: {query}")
+    logger.info("Composing benchmark card for: %s", query)
 
-    # Log available data sources
-    data_sources = []
-    if unitxt_metadata:
-        data_sources.append("UnitXT")
-    if hf_metadata:
-        data_sources.append("HuggingFace")
-    if extracted_ids:
-        data_sources.append("Extracted IDs")
-    if docling_output and docling_output.get("success"):
-        data_sources.append("Academic Paper")
-    if eee_metadata:
-        data_sources.append("EEE")
+    # --- Determine available sources ---
+    has_paper = bool(docling_output and docling_output.get("success"))
+    has_hf = bool(hf_metadata)
+    has_hf_readme = bool(_get_hf_readme(hf_metadata))
+    has_eee = bool(eee_metadata)
 
-    logger.debug(f"Available data sources: {', '.join(data_sources)}")
+    source_list = []
+    if has_paper:
+        source_list.append("Paper")
+    if has_hf_readme:
+        source_list.append("HF-README")
+    elif has_hf:
+        source_list.append("HF-basic")
+    if has_eee:
+        source_list.append("EEE")
+    logger.info("Available sources: %s", ", ".join(source_list) or "none")
 
-    # Initialize paper retriever for RAG-lite (index once, retrieve per section)
+    # =====================================================================
+    # PHASE 1: RAG-lite — collect paper chunks
+    # =====================================================================
     paper_retriever = None
-    if docling_output and docling_output.get("success"):
-        try:
-            paper_text = docling_output.get("filtered_text", "")
-            if paper_text:
-                logger.debug("Initializing paper retriever for RAG-lite")
-                # Initialize embeddings based on config
+    all_paper_content = ""
+
+    if has_paper:
+        paper_text = docling_output.get("filtered_text", "")
+        if paper_text:
+            try:
                 if Config.DEFAULT_EMBEDDING_MODEL == "bge-large":
                     embeddings = HuggingFaceEmbeddings(
                         model_name="BAAI/bge-large-en-v1.5",
@@ -543,34 +1361,156 @@ def compose_benchmark_card(
                         model_kwargs={"device": "cpu"},
                         encode_kwargs={"normalize_embeddings": True},
                     )
-                else:  # minilm fallback
+                else:
                     embeddings = HuggingFaceEmbeddings(
                         model_name="sentence-transformers/all-MiniLM-L6-v2"
                     )
 
-                # Chunk paper for retrieval (smaller chunks for better precision)
                 splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=1000,
-                    chunk_overlap=200,
-                    separators=["\n\n", "\n", ". ", " "]
+                    chunk_size=1000, chunk_overlap=200,
+                    separators=["\n\n", "\n", ". ", " "],
                 )
                 chunks = splitter.split_text(paper_text)
-
-                # Create documents
                 documents = [
-                    Document(page_content=chunk, metadata={"chunk_idx": i})
-                    for i, chunk in enumerate(chunks)
+                    Document(page_content=c, metadata={"chunk_idx": i})
+                    for i, c in enumerate(chunks)
                 ]
-
-                # Create vectorstore and retriever
                 paper_vectorstore = Chroma.from_documents(documents, embeddings)
                 paper_retriever = paper_vectorstore.as_retriever(search_kwargs={"k": 5})
-                logger.debug(f"Paper indexed: {len(chunks)} chunks ready for retrieval")
-        except Exception as e:
-            logger.warning(f"Failed to initialize paper retriever: {e}")
-            paper_retriever = None
+                logger.debug("Paper indexed: %d chunks", len(chunks))
 
-    # define the sections to generate
+                # Collect chunks across ALL sections for comprehensive extraction
+                seen = set()
+                all_chunks = []
+                for queries in SECTION_QUERIES.values():
+                    for sq in queries:
+                        for chunk in paper_retriever.get_relevant_documents(sq):
+                            key = chunk.page_content[:200]
+                            if key not in seen:
+                                seen.add(key)
+                                all_chunks.append(chunk)
+
+                if all_chunks:
+                    formatted = []
+                    budget = 12000
+                    used = 0
+                    for i, chunk in enumerate(all_chunks, 1):
+                        text = chunk.page_content
+                        if used + len(text) > budget:
+                            remaining = budget - used
+                            if remaining > 100:
+                                formatted.append(f"[Section {i}]\n{text[:remaining]}")
+                            break
+                        formatted.append(f"[Section {i}]\n{text}")
+                        used += len(text)
+                    all_paper_content = "\n\n".join(formatted)
+                    logger.info("Paper: %d unique chunks, %d chars for extraction", len(all_chunks), used)
+            except Exception as e:
+                logger.warning("Paper retrieval failed: %s", e)
+
+        # Fallback: raw truncated paper text
+        if not all_paper_content and paper_text:
+            all_paper_content = paper_text[:12000]
+            logger.info("Using raw paper text (truncated to 12000 chars)")
+
+    # =====================================================================
+    # PHASE 2: Source-isolated extraction
+    # =====================================================================
+
+    # Compute benchmark identity anchor from deterministic sources BEFORE extraction
+    identity_anchor = _get_benchmark_identity(query, hf_metadata, eee_metadata)
+    if identity_anchor:
+        logger.info("Benchmark identity: %s", identity_anchor)
+
+    # 2a. Extract from paper (1 LLM call, heavy model)
+    paper_facts = ""
+    if all_paper_content:
+        paper_facts = extract_facts_from_paper(all_paper_content, query, identity_anchor)
+
+    # 2b. Extract from HF README (1 LLM call, heavy model)
+    # For large READMEs, RAG-index them like papers for better coverage
+    hf_facts = ""
+    hf_retriever = None
+    if has_hf_readme:
+        readme_text = _get_hf_readme(hf_metadata)
+        if readme_text and len(readme_text) > 4000:
+            try:
+                if Config.DEFAULT_EMBEDDING_MODEL == "bge-large":
+                    hf_embeddings = HuggingFaceEmbeddings(
+                        model_name="BAAI/bge-large-en-v1.5",
+                        model_kwargs={"device": "cpu"},
+                        encode_kwargs={"normalize_embeddings": True},
+                    )
+                else:
+                    hf_embeddings = HuggingFaceEmbeddings(
+                        model_name="sentence-transformers/all-MiniLM-L6-v2"
+                    )
+
+                hf_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=800, chunk_overlap=150,
+                    separators=["\n\n", "\n", ". ", " "],
+                )
+                hf_chunks = hf_splitter.split_text(readme_text)
+                hf_documents = [
+                    Document(page_content=c, metadata={"chunk_idx": i, "source": "hf_readme"})
+                    for i, c in enumerate(hf_chunks)
+                ]
+                hf_vectorstore = Chroma.from_documents(hf_documents, hf_embeddings)
+                hf_retriever = hf_vectorstore.as_retriever(search_kwargs={"k": 4})
+                logger.info("HF README indexed: %d chunks (%d chars)", len(hf_chunks), len(readme_text))
+            except Exception as e:
+                logger.warning("HF README indexing failed, using raw text: %s", e)
+
+        hf_facts = extract_facts_from_hf_readme(hf_metadata, query, hf_retriever, identity_anchor)
+
+    # 2c. Deterministic extraction (no LLM)
+    det_facts = extract_deterministic_facts(eee_metadata, hf_metadata, extracted_ids)
+
+    # =====================================================================
+    # PHASE 3: Lightweight contamination check
+    # =====================================================================
+    full_paper_text = ""
+    if has_paper:
+        full_paper_text = docling_output.get("filtered_text", "")
+
+    # Check paper facts for cross-benchmark contamination
+    if paper_facts and (full_paper_text or all_paper_content):
+        paper_facts = check_cross_contamination(
+            paper_facts, full_paper_text or all_paper_content, query, identity_anchor
+        )
+
+    # Check HF facts for contamination against README text
+    if hf_facts and has_hf_readme:
+        readme_text_for_check = _get_hf_readme(hf_metadata)
+        if readme_text_for_check:
+            hf_facts = check_cross_contamination(
+                hf_facts, readme_text_for_check, query, identity_anchor
+            )
+
+    # =====================================================================
+    # PHASE 3b: Gap-filling — targeted retrieval for missing fields
+    # =====================================================================
+
+    if paper_facts and paper_retriever:
+        paper_facts = _fill_paper_gaps(
+            paper_facts, paper_retriever, query, full_paper_text or all_paper_content
+        )
+
+    # Also gap-fill from HF README if it was indexed
+    if hf_facts and hf_retriever:
+        readme_text = _get_hf_readme(hf_metadata)
+        hf_facts = _fill_paper_gaps(
+            hf_facts, hf_retriever, query, readme_text or ""
+        )
+
+    # =====================================================================
+    # PHASE 4: Merge all facts with source tags
+    # =====================================================================
+    merged_facts = merge_extracted_facts(paper_facts, hf_facts, det_facts, query)
+
+    # =====================================================================
+    # PHASE 5: Compose each section (5 LLM calls, heavy model)
+    # =====================================================================
     sections = [
         ("benchmark_details", BenchmarkDetails),
         ("purpose_and_intended_users", PurposeAndIntendedUsers),
@@ -579,41 +1519,11 @@ def compose_benchmark_card(
         ("ethical_and_legal_considerations", EthicalAndLegalConsiderations),
     ]
 
-    # Section-specific query templates for retrieval
-    # Multiple queries per section to improve recall across different paper sections
-    section_queries = {
-        "benchmark_details": [
-            "benchmark name overview introduction contribution",
-            "related work similar benchmarks comparison",
-            "resources homepage leaderboard repository URL",
-        ],
-        "data": [
-            "dataset collection source corpus sub-task data origin",
-            "dataset size examples training test split statistics",
-            "annotation crowdsource label annotator agreement quality",
-        ],
-        "methodology": [
-            "evaluation method metrics accuracy F1 score measurement",
-            "baseline results performance human comparison model scores",
-            "diagnostic analysis validation quality assurance",
-        ],
-        "purpose_and_intended_users": [
-            "goal objective motivation purpose research question",
-            "tasks sub-tasks evaluation individual task description",
-            "limitations bias constraints scope out-of-scope",
-        ],
-        "ethical_and_legal_considerations": [
-            "ethics privacy anonymity personal information",
-            "license consent crowdworker compensation IRB",
-        ],
-    }
-
-    # Load the gold example for format anchoring
+    # Load gold example for format anchoring
     gold_example_path = Path(__file__).parent / "gold_example.json"
     gold_example: Dict[str, Any] = {}
     try:
         gold_example = json.loads(gold_example_path.read_text())
-        logger.debug("Loaded gold example for format anchoring")
     except Exception as e:
         logger.warning("Could not load gold example: %s", e)
 
@@ -621,90 +1531,41 @@ def compose_benchmark_card(
     all_provenance = {}
 
     for section_name, section_class in sections:
-        logger.debug("Generating %s", section_name.replace("_", " ").title())
+        logger.info("Composing section: %s", section_name)
 
-        # ── Step 0: Retrieve relevant paper chunks (RAG-lite) ──
-        # Uses multiple queries per section for broader coverage, deduplicates by content
-        paper_content = "Not available"
-        if paper_retriever:
-            try:
-                queries = section_queries.get(section_name, [section_name.replace("_", " ")])
-                # Collect unique chunks from all sub-queries
-                seen_chunks = set()
-                all_chunks = []
-                for sq in queries:
-                    for chunk in paper_retriever.get_relevant_documents(sq):
-                        chunk_key = chunk.page_content[:200]
-                        if chunk_key not in seen_chunks:
-                            seen_chunks.add(chunk_key)
-                            all_chunks.append(chunk)
+        section_facts = merged_facts.get(section_name, "No facts available.")
 
-                if all_chunks:
-                    formatted_chunks = []
-                    char_budget = 3000
-                    chars_used = 0
-                    for i, chunk in enumerate(all_chunks, 1):
-                        text = chunk.page_content
-                        if chars_used + len(text) > char_budget:
-                            remaining = char_budget - chars_used
-                            if remaining > 100:
-                                formatted_chunks.append(f"[Paper Section {i}]\n{text[:remaining]}")
-                            break
-                        formatted_chunks.append(f"[Paper Section {i}]\n{text}")
-                        chars_used += len(text)
-                    paper_content = "\n\n".join(formatted_chunks)
-                    logger.debug(f"Retrieved {len(all_chunks)} unique paper chunks for {section_name} (from {len(queries)} queries)")
-                else:
-                    logger.debug(f"No relevant chunks found for {section_name}, using fallback")
-                    if docling_output and docling_output.get("filtered_text"):
-                        paper_content = docling_output.get("filtered_text", "")[:3000]
-            except Exception as e:
-                logger.warning(f"Paper retrieval failed for {section_name}: {e}")
-                if docling_output and docling_output.get("filtered_text"):
-                    paper_content = docling_output.get("filtered_text", "")[:3000]
-        elif docling_output and docling_output.get("success"):
-            paper_content = docling_output.get("filtered_text", "Not available")[:3000]
-
-        # ── Step 1: EXTRACT — light model extracts key facts ──
-        extracted_facts = extract_section_facts(
-            section_name=section_name,
-            paper_content=paper_content,
-            hf_metadata=hf_metadata,
-            unitxt_metadata=unitxt_metadata,
-            extracted_ids=extracted_ids,
-            query=query,
-            eee_metadata=eee_metadata,
-        )
-
-        # ── Step 2: COMPOSE — heavy model formats facts into schema ──
-        # Build the gold example snippet for this section
-        # Escape curly braces so ChatPromptTemplate doesn't treat them as variables
+        # Gold example snippet
         gold_snippet = ""
         if gold_example and section_name in gold_example:
             gold_json = json.dumps(gold_example[section_name], indent=2)
             gold_json_escaped = gold_json.replace("{", "{{").replace("}", "}}")
             gold_snippet = (
-                f"\n\nGOLD EXAMPLE (use this as a FORMAT reference — match the style, length, and level of detail):\n"
+                f"\n\nGOLD EXAMPLE (FORMAT reference — match style and detail level):\n"
                 f"```json\n{gold_json_escaped}\n```"
             )
 
-        # Choose prompt based on whether extraction succeeded
-        if extracted_facts:
-            # Extraction succeeded → composer gets compressed facts
-            section_prompt = ChatPromptTemplate.from_messages(
-                [
-                    (
-                        "system",
-                        f"""You are documenting an AI benchmark. Generate the '{section_name}' section.
+        section_prompt = ChatPromptTemplate.from_messages([
+            (
+                "system",
+                f"""You are documenting the AI benchmark "{{query}}". Generate the '{section_name}' section.
 
-You are given PRE-EXTRACTED FACTS (bullet points) that have already been filtered from the original sources. Your job is to FORMAT these facts into the required JSON schema — do NOT add information beyond what the facts state.
+You are given DESCRIBED FACTS from multiple sources, each tagged with its origin:
+- [PAPER]: From the research paper (most authoritative for methodology, baselines)
+- [HF_README]: From the HuggingFace dataset page
+- [DETERMINISTIC]: Verified facts from structured metadata (always correct)
+- [EEE]: Evaluation results from Every Eval Ever
 
 RULES:
-1. Use ONLY the extracted facts below. If a field has no facts, write exactly "Not specified".
-2. Write in third person. Describe the benchmark objectively.
-3. Do not invent facts, URLs, numbers, or performance scores.
-4. Be concise. Match the style and length of the gold example.
-5. Each field value should be a clean, well-written summary of the relevant facts — not a dump of all bullets.
+1. Use ONLY the facts provided below. Do NOT add information from your own knowledge about this or any benchmark.
+2. If facts from different sources conflict, prefer [DETERMINISTIC] > [PAPER] > [HF_README] > [EEE].
+3. If a field has no facts from any source, write exactly "Not specified".
+4. Write in third person. Be concise and clear. Match the gold example style.
+5. Write in your own words — synthesize the facts into natural, readable descriptions. Do NOT copy raw text fragments.
+6. Do NOT mention other benchmarks unless the [PAPER] facts explicitly name them.
+7. For baseline_results: separate PAPER baselines (original results) from EEE results (evaluation suite results).
+8. Do NOT invent numbers, dataset sizes, platform names, or methodology details that are not in the facts below.
+9. SKIP any facts tagged [SUSPECT] — these may be from a different benchmark. Do not use them.
 {gold_snippet}
 
 PROVENANCE TRACKING (REQUIRED):
@@ -712,152 +1573,56 @@ For every field you fill in (except "Not specified"), include a provenance entry
 {{{{
   "provenance": {{{{
     "field_name": {{{{
-      "source": "paper|huggingface|unitxt|extracted_ids",
-      "evidence": "the key fact that supports this field value"
+      "source": "paper|huggingface|eee|deterministic",
+      "evidence": "the key fact that supports this value"
     }}}}
   }}}}
 }}}}""",
-                    ),
-                    (
-                        "user",
-                        f"""Benchmark: {{query}}
+            ),
+            (
+                "user",
+                f"""Benchmark: {{query}}
 
-EXTRACTED FACTS:
-{{extracted_facts}}
+SOURCE-TAGGED FACTS:
+{{section_facts}}
 
-Generate the {section_name} section by formatting these facts into the required schema.""",
-                    ),
-                ]
-            )
+Generate the {section_name} section.""",
+            ),
+        ])
 
-            chain = section_prompt | LLM.with_structured_output(section_class)
+        chain = section_prompt | LLM.with_structured_output(section_class)
 
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    section_result = chain.invoke(
-                        {
-                            "query": query,
-                            "extracted_facts": extracted_facts,
-                        }
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                section_result = chain.invoke({
+                    "query": query,
+                    "section_facts": section_facts,
+                })
+                section_dict = section_result.model_dump()
+                clean_section, section_provenance = extract_provenance(section_dict)
+                generated_sections[section_name] = clean_section
+                if section_provenance:
+                    all_provenance[section_name] = section_provenance
+                logger.info("Section %s completed", section_name)
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        "Failed %s (attempt %d/%d): %s",
+                        section_name, attempt + 1, max_retries, e,
                     )
-                    section_dict = section_result.model_dump()
-                    clean_section, section_provenance = extract_provenance(section_dict)
-                    generated_sections[section_name] = clean_section
-                    if section_provenance:
-                        all_provenance[section_name] = section_provenance
-                    logger.debug("%s completed (extract→compose)", section_name.replace("_", " ").title())
-                    break
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        logger.warning("Failed to compose %s (attempt %d/%d): %s", section_name, attempt + 1, max_retries, e)
-                    else:
-                        logger.error("Failed to compose %s after %d attempts: %s", section_name, max_retries, e)
-                        raise
-        else:
-            # Extraction failed → fallback to direct composition with raw sources
-            logger.info("Extraction failed for %s, falling back to direct composition", section_name)
-
-            hf_formatted = "Not available"
-            if hf_metadata:
-                if isinstance(hf_metadata, dict):
-                    hf_compact = _compact_hf_metadata(hf_metadata)
-                    hf_formatted = json.dumps(hf_compact, indent=2) if hf_compact else "Not available"
                 else:
-                    hf_formatted = str(hf_metadata)[:2000]
+                    logger.error(
+                        "Failed %s after %d attempts: %s",
+                        section_name, max_retries, e,
+                    )
+                    raise
 
-            extracted_formatted = json.dumps(extracted_ids, indent=2) if extracted_ids else "Not available"
-
-            # Build fallback sources and invoke variables dynamically
-            fallback_invoke_vars = {
-                "query": query,
-                "paper_content": paper_content,
-                "hf_metadata": hf_formatted,
-                "extracted_ids": extracted_formatted,
-            }
-
-            # Build numbered source list for the prompt
-            fb_sources = [
-                "1. PAPER CONTENT:\n{paper_content}",
-                "2. HuggingFace Dataset:\n{hf_metadata}",
-            ]
-            fb_idx = 3
-            if unitxt_metadata:
-                unitxt_formatted = json.dumps(unitxt_metadata, indent=2)
-                fb_sources.append(f"{fb_idx}. UnitXT Catalog:\n" + "{unitxt_metadata}")
-                fallback_invoke_vars["unitxt_metadata"] = unitxt_formatted
-                fb_idx += 1
-            fb_sources.append(f"{fb_idx}. Extracted IDs:\n" + "{extracted_ids}")
-            fb_idx += 1
-            if eee_metadata:
-                eee_compact = _compact_eee_metadata(eee_metadata)
-                eee_formatted = json.dumps(eee_compact, indent=2)
-                fb_sources.append(f"{fb_idx}. Every Eval Ever (EEE) Evaluation Data:\n" + "{eee_metadata}")
-                fallback_invoke_vars["eee_metadata"] = eee_formatted
-
-            fallback_sources_block = "\n\n".join(fb_sources)
-
-            # Determine valid source names for provenance
-            source_names = "paper|huggingface|extracted_ids"
-            if unitxt_metadata:
-                source_names += "|unitxt"
-            if eee_metadata:
-                source_names += "|eee"
-
-            section_prompt = ChatPromptTemplate.from_messages(
-                [
-                    (
-                        "system",
-                        "You are documenting an AI benchmark. Generate the '" + section_name + "' section.\n\n"
-                        "RULES:\n"
-                        "1. Use ONLY the provided metadata sources. If information is not found, write exactly \"Not specified\".\n"
-                        "2. Write in third person. Describe the benchmark objectively.\n"
-                        "3. Do not invent facts, URLs, numbers, or performance scores. Only include what the sources explicitly state.\n"
-                        "4. Be concise. Match the style and length of the gold example.\n"
-                        + gold_snippet + "\n\n"
-                        "PROVENANCE TRACKING (REQUIRED):\n"
-                        "For every field you fill in (except \"Not specified\"), include a provenance entry:\n"
-                        "{{\n"
-                        '  "provenance": {{\n'
-                        '    "field_name": {{\n'
-                        '      "source": "' + source_names + '",\n'
-                        '      "evidence": "exact quote or description from the source"\n'
-                        "    }}\n"
-                        "  }}\n"
-                        "}}",
-                    ),
-                    (
-                        "user",
-                        "Benchmark: {query}\n\n"
-                        "METADATA SOURCES:\n\n"
-                        + fallback_sources_block + "\n\n"
-                        "Generate the " + section_name + " section using ONLY the sources above.",
-                    ),
-                ]
-            )
-
-            chain = section_prompt | LLM.with_structured_output(section_class)
-
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    section_result = chain.invoke(fallback_invoke_vars)
-                    section_dict = section_result.model_dump()
-                    clean_section, section_provenance = extract_provenance(section_dict)
-                    generated_sections[section_name] = clean_section
-                    if section_provenance:
-                        all_provenance[section_name] = section_provenance
-                    logger.debug("%s completed (direct)", section_name.replace("_", " ").title())
-                    break
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        logger.warning("Failed to generate %s (attempt %d/%d): %s", section_name, attempt + 1, max_retries, e)
-                    else:
-                        logger.error("Failed to generate %s after %d attempts: %s", section_name, max_retries, e)
-                        raise
-
-    # combine all sections into final benchmark card
-    logger.debug("Combining all sections into final benchmark card")
+    # =====================================================================
+    # PHASE 6: Assemble card
+    # =====================================================================
+    logger.debug("Assembling final benchmark card")
 
     try:
         final_card = BenchmarkCard(
@@ -871,20 +1636,29 @@ Generate the {section_name} section by formatting these facts into the required 
                 **generated_sections["ethical_and_legal_considerations"]
             ),
         )
-
-        logger.debug("Final benchmark card assembled successfully")
-
     except Exception as e:
         logger.error("Failed to assemble final benchmark card: %s", e)
         raise
 
-    # add metadata about the composition process
-    # Exclude provenance from benchmark_card output (it's saved separately)
     benchmark_card_dict = final_card.model_dump(exclude_none=True)
-    # Double-check: remove any remaining provenance fields from nested sections
     for section_key in benchmark_card_dict:
-        if isinstance(benchmark_card_dict[section_key], dict) and "provenance" in benchmark_card_dict[section_key]:
-            del benchmark_card_dict[section_key]["provenance"]
+        if isinstance(benchmark_card_dict[section_key], dict):
+            benchmark_card_dict[section_key].pop("provenance", None)
+
+    # =====================================================================
+    # PHASE 7: Deterministic overrides
+    # =====================================================================
+    benchmark_card_dict = apply_deterministic_overrides(benchmark_card_dict, det_facts)
+
+    # =====================================================================
+    # PHASE 8: Post-processing
+    # =====================================================================
+    benchmark_card_dict = post_process_card(benchmark_card_dict)
+
+    # =====================================================================
+    # PHASE 9: Confidence
+    # =====================================================================
+    confidence = compute_card_confidence(has_paper, has_hf_readme, has_eee, has_hf)
 
     return {
         "benchmark_card": benchmark_card_dict,
@@ -894,12 +1668,13 @@ Generate the {section_name} section by formatting these facts into the required 
                 "unitxt": bool(unitxt_metadata),
                 "huggingface": bool(hf_metadata),
                 "extracted_ids": bool(extracted_ids),
-                "docling": bool(docling_output),
-                "eee": bool(eee_metadata),
+                "docling": has_paper,
+                "eee": has_eee,
             },
             "query": query,
             "composition_timestamp": datetime.now().isoformat(),
-            "generation_method": "extract_then_compose",
+            "generation_method": "source_isolated_extraction",
             "model_used": LLM.model_name,
+            "confidence": confidence,
         },
     }

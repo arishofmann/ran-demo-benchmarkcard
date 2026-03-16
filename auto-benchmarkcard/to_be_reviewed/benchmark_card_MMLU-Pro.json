@@ -1,0 +1,181 @@
+{
+  "benchmark_card": {
+    "benchmark_details": {
+      "name": "MMLU-Pro",
+      "overview": "MMLU-Pro is a more robust and challenging benchmark for evaluating language models' capabilities. It comprises 14 discipline subsets and integrates questions from multiple sources, including the original MMLU dataset, STEM Website, TheoremQA, and SciBench.",
+      "data_type": "tabular, text",
+      "domains": [
+        "academic disciplines",
+        "math",
+        "physics",
+        "business",
+        "history",
+        "psychology"
+      ],
+      "languages": [
+        "English"
+      ],
+      "similar_benchmarks": [
+        "MMLU"
+      ],
+      "resources": [
+        "https://arxiv.org/abs/2406.01574",
+        "https://huggingface.co/datasets/TIGER-Lab/MMLU-Pro",
+        "https://huggingface.co/spaces/TIGER-Lab/MMLU-Pro",
+        "https://storage.googleapis.com/crfm-helm-public/capabilities/benchmark_output/releases/v1.15.0/groups/core_scenarios.json"
+      ]
+    },
+    "purpose_and_intended_users": {
+      "goal": "To provide a more challenging benchmark to fully test the limits of LLM capabilities, to improve consistency and reliability in assessing language models' capabilities over the original MMLU, and to distinguish performance differences among models, especially in computation and reasoning-intensive subjects.",
+      "audience": [
+        "Not specified"
+      ],
+      "tasks": [
+        "Question answering"
+      ],
+      "limitations": "Not specified",
+      "out_of_scope_uses": [
+        "Not specified"
+      ]
+    },
+    "data": {
+      "source": "Original MMLU dataset (filtered), STEM Website (converted to MCQs via GPT-4-Turbo), TheoremQA (human-annotated), and SciBench.",
+      "size": "10K to 100K examples",
+      "format": "parquet",
+      "annotation": "Questions from TheoremQA are human-annotated. False Negative Options are generated using Gemini-1.5-Pro."
+    },
+    "methodology": {
+      "methods": [
+        "Evaluations involve using different prompts (24 were tested)."
+      ],
+      "metrics": [
+        "MMLU-Pro",
+        "MMLU-PRO"
+      ],
+      "calculation": "Not specified",
+      "interpretation": "Lower prompt sensitivity (around 2% impact) indicates improved consistency over MMLU. A wide accuracy range (e.g., from over 70% to just over 20%) illustrates performance disparities.",
+      "baseline_results": "PAPER: GPT-4o: over 70% accuracy in Math and Physics. Mistral-7B-v0.1: just over 20% accuracy in Math and Physics. Llama-3-70B-Instruct: 56.2%. Phi-3-medium-4k-instruct: 55.7%. DeepSeek-V2-Chat: 54.8%. Llama-3-70B: 52.8%. Qwen1.5-72B-Chat: 52.6%. Yi-1.5-34B-Chat: 52.3%. EEE: OLMo 2 32B Instruct March 2025: 0.4140 (MMLU-Pro).",
+      "validation": "Questions answered correctly by more than four out of eight specified models were filtered out as 'too easy'. The benchmark shows reduced prompt sensitivity compared to MMLU, indicating improved reliability."
+    },
+    "ethical_and_legal_considerations": {
+      "privacy_and_anonymity": "Not specified",
+      "data_licensing": "MIT License",
+      "consent_procedures": "Not specified",
+      "compliance_with_regulations": "Not specified"
+    },
+    "flagged_fields": {
+      "purpose_and_intended_users.limitations": "[Possible Hallucination], no supporting evidence found in source material",
+      "purpose_and_intended_users.out_of_scope_uses": "[Possible Hallucination], no supporting evidence found in source material"
+    },
+    "missing_fields": [
+      "purpose_and_intended_users.audience",
+      "purpose_and_intended_users.limitations",
+      "purpose_and_intended_users.out_of_scope_uses",
+      "methodology.calculation",
+      "ethical_and_legal_considerations.privacy_and_anonymity",
+      "ethical_and_legal_considerations.consent_procedures",
+      "ethical_and_legal_considerations.compliance_with_regulations"
+    ],
+    "possible_risks": [
+      {
+        "category": "Lack of model transparency",
+        "description": [
+          "Lack of model transparency is due to insufficient documentation of the model design, development, and evaluation process and the absence of insights into the inner workings of the model."
+        ],
+        "type": "Risk",
+        "concern": "Transparency is important for legal compliance, AI ethics, and guiding appropriate use of models. Missing information might make it more difficult to evaluate risks,  change the model, or reuse it.\u00a0 Knowledge about who built a model can also be an important factor in deciding whether to trust it. Additionally, transparency regarding how the model\u2019s risks were determined, evaluated, and mitigated also play a role in determining model risks, identifying model suitability, and governing model usage.",
+        "url": "https://www.ibm.com/docs/en/watsonx/saas?topic=SSYOK8/wsj/ai-risk-atlas/lack-of-model-transparency.html",
+        "taxonomy": "ibm-risk-atlas"
+      },
+      {
+        "category": "Unrepresentative data",
+        "description": [
+          "Unrepresentative data occurs when the training or fine-tuning data is not sufficiently representative of the underlying population or does not measure the phenomenon of interest. Synthetic data might not fully capture the complexity and nuances of real-world data. Causes include possible limitations in the seed data quality, biases in generation methods, or inadequate domain knowledge. Thus, AI models might struggle to generalize effectively to real-world scenarios."
+        ],
+        "type": "Risk",
+        "concern": "If the data is not representative, then the model will not work as intended.",
+        "url": "https://www.ibm.com/docs/en/watsonx/saas?topic=SSYOK8/wsj/ai-risk-atlas/unrepresentative-data.html",
+        "taxonomy": "ibm-risk-atlas"
+      },
+      {
+        "category": "Improper data curation",
+        "description": [
+          "Improper collection, generation, and preparation of training or tuning data can result in data label errors, conflicting information or misinformation."
+        ],
+        "type": "Risk",
+        "concern": "Improper data curation, including errors in synthetic data generation, can adversely affect how a model is trained, resulting in a model that does not behave in accordance with the intended values. Correcting problems after the model is trained and deployed might be insufficient for guaranteeing proper behavior.",
+        "url": "https://www.ibm.com/docs/en/watsonx/saas?topic=SSYOK8/wsj/ai-risk-atlas/data-curation.html",
+        "taxonomy": "ibm-risk-atlas"
+      },
+      {
+        "category": "Data bias",
+        "description": [
+          "Historical and societal biases might be present in data that are used to train and fine-tune models. Biases can also be inherited from seed data or exacerbated by synthetic data generation methods."
+        ],
+        "type": "Risk",
+        "concern": "Training an AI system on data with bias, such as historical or societal bias, can lead to biased or skewed outputs that can unfairly represent or otherwise discriminate against certain groups or individuals.",
+        "url": "https://www.ibm.com/docs/en/watsonx/saas?topic=SSYOK8/wsj/ai-risk-atlas/data-bias.html",
+        "taxonomy": "ibm-risk-atlas"
+      },
+      {
+        "category": "Overfitting",
+        "description": [
+          "Overfitting occurs when a model or algorithm memorizes and fits too closely or exactly to its training data. Overfitting results in a model that might not be able to make accurate predictions or conclusions from any data other than the training data and potentially fails in unexpected scenarios. Overfitting is also related to model collapse, which involves repeatedly training generative models on synthetic data that is generated with LLMs causing the model to lose information and become less accurate."
+        ],
+        "type": "Risk",
+        "concern": "Overfitting to synthetic data can undermine the broad applicability and adaptability of foundation models, which are designed to be general-purpose and widely applicable. If a foundation model overfits to the synthetic data, it may fail to perform well in diverse real-world scenarios, limiting its potential to provide value and support decision-making in a wide range of contexts. This raises the need to negotiate issues with alignment or contextual relevance for model use and balance the benefits of fine-tuning with the risks of overfitting.",
+        "url": "https://www.ibm.com/docs/en/watsonx/saas?topic=SSYOK8/wsj/ai-risk-atlas/overfitting.html",
+        "taxonomy": "ibm-risk-atlas"
+      }
+    ],
+    "card_info": {
+      "created_at": "2026-03-16T15:55:56.563134",
+      "llm": "deepseek-ai/DeepSeek-V3.2",
+      "confidence": {
+        "confidence_level": "high",
+        "sources_available": {
+          "paper": true,
+          "hf_readme": true,
+          "hf_basic_metadata": true,
+          "eee": true
+        }
+      },
+      "generation_method": "source_isolated_extraction",
+      "sources_used": {
+        "unitxt": false,
+        "huggingface": true,
+        "extracted_ids": true,
+        "docling": true,
+        "eee": true
+      }
+    },
+    "evaluation_summary": {
+      "total_models_evaluated": 2,
+      "primary_metric": "MMLU-Pro",
+      "metric_config": {
+        "lower_is_better": false,
+        "score_type": "continuous",
+        "min_possible": 0.0,
+        "max_possible": 1.0
+      },
+      "score_statistics": {
+        "mean": 0.414,
+        "std_dev": 0.0,
+        "min": 0.414,
+        "max": 0.414
+      },
+      "top_performers": [
+        {
+          "model": "OLMo 2 32B Instruct March 2025",
+          "developer": "allenai",
+          "score": 0.414
+        }
+      ],
+      "all_metrics": [
+        "MMLU-Pro",
+        "MMLU-PRO"
+      ],
+      "source": "Every Eval Ever (EEE)"
+    }
+  }
+}

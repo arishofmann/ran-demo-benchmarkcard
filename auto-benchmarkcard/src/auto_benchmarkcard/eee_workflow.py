@@ -164,12 +164,23 @@ def process_single_benchmark(
     try:
         final_state = workflow.invoke(initial_state)
 
-        # Inject evaluation summary into the final card
+        # Inject evaluation summary and composition metadata into the final card
         final_card = final_state.get("final_card")
         if final_card and eee_metadata:
             final_card = _inject_evaluation_summary(final_card, eee_metadata)
 
-            # Re-save the card with evaluation summary
+            # Inject confidence and composition metadata from composer
+            composed_card = final_state.get("composed_card", {})
+            if isinstance(composed_card, dict):
+                comp_meta = composed_card.get("composition_metadata")
+                if comp_meta:
+                    card = final_card.get("benchmark_card", final_card)
+                    card["card_info"] = card.get("card_info", {})
+                    card["card_info"]["confidence"] = comp_meta.get("confidence", {})
+                    card["card_info"]["generation_method"] = comp_meta.get("generation_method")
+                    card["card_info"]["sources_used"] = comp_meta.get("sources_used", {})
+
+            # Re-save the card with evaluation summary and metadata
             card_filename = f"benchmark_card_{safe_name}.json"
             output_manager.save_benchmark_card(final_card, card_filename)
             logger.info("Saved benchmark card with evaluation summary: %s", card_filename)
