@@ -36,6 +36,12 @@ class Config:
     DEFAULT_FACTUALITY_THRESHOLD: float = 0.8
     DEFAULT_TOP_K: int = 4
 
+    # Paper extraction budget (chars) — how much paper text to send to the LLM
+    # DeepSeek-V3 supports 128K tokens; 25K chars ≈ 6K tokens, leaves ample room
+    PAPER_EXTRACTION_BUDGET: int = 25000
+    # Chars from start of paper always included (abstract + introduction)
+    PAPER_INTRO_CHARS: int = 4000
+
     # RAG Configuration
     ENABLE_LLM_RERANKING: bool = True
     ENABLE_HYBRID_SEARCH: bool = True

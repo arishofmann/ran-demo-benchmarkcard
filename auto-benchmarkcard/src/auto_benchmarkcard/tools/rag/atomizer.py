@@ -147,6 +147,10 @@ def text_to_statements(text: str, separator: str = "- ") -> List[dict]:
                 logger.warning(f"Invalid field path '{field}' - using fallback mapping")
                 field = _map_to_valid_field(field, statement)
 
+            # Drop atoms that couldn't be mapped to a real field
+            if field == "unknown":
+                logger.debug("Dropping unmapped atom: %s", statement[:80])
+                continue
             statements.append({"text": statement, "field": field})
     return statements
 
@@ -295,16 +299,17 @@ class BenchmarkCardAtomizer:
 
 
 def exclude_risk_sections(benchmark_card: Dict[str, Any]) -> Dict[str, Any]:
-    """Remove risk sections from benchmark card.
+    """Remove risk sections and 'Not specified' fields from benchmark card.
 
     Risk information is not fact-checked as it's inferred rather than
-    directly stated in source documents.
+    directly stated in source documents. Fields with 'Not specified'
+    values are skipped because they produce useless claims.
 
     Args:
         benchmark_card: Original benchmark card dictionary.
 
     Returns:
-        Filtered benchmark card without risk sections.
+        Filtered benchmark card without risk sections or empty fields.
     """
     import copy
 
@@ -313,6 +318,20 @@ def exclude_risk_sections(benchmark_card: Dict[str, Any]) -> Dict[str, Any]:
     if "targeted_risks" in filtered_card:
         logger.debug("Excluding risk sections from fact verification")
         del filtered_card["targeted_risks"]
+
+    # Remove "Not specified" fields — they produce useless atoms like
+    # "It has limitations not specified" that can't be verified
+    _NOT_SPECIFIED = {"not specified", "not specified.", "no information found"}
+    for section_name, section in list(filtered_card.items()):
+        if not isinstance(section, dict):
+            continue
+        for field_name, value in list(section.items()):
+            if isinstance(value, str) and value.strip().lower() in _NOT_SPECIFIED:
+                del section[field_name]
+            elif (isinstance(value, list) and len(value) == 1
+                  and isinstance(value[0], str)
+                  and value[0].strip().lower() in _NOT_SPECIFIED):
+                del section[field_name]
 
     return filtered_card
 

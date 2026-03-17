@@ -74,26 +74,44 @@ def build_eee_initial_state(
     }
 
 
-def _inject_evaluation_summary(final_card: Dict[str, Any], eee_metadata: Dict[str, Any]) -> Dict[str, Any]:
-    """Inject the EEE evaluation summary into the final benchmark card.
+_CARD_FIELD_ORDER = [
+    "benchmark_details",
+    "purpose_and_intended_users",
+    "data",
+    "methodology",
+    "ethical_and_legal_considerations",
+    "possible_risks",
+    "flagged_fields",
+    "missing_fields",
+    "card_info",
+]
 
-    Adds the evaluation_summary field with aggregated model performance data.
 
-    Args:
-        final_card: The completed benchmark card dict.
-        eee_metadata: EEE metadata containing evaluation_summary.
+def _reorder_card_fields(card: Dict[str, Any]) -> Dict[str, Any]:
+    """Reorder card fields to match canonical schema order."""
+    ordered = {}
+    for key in _CARD_FIELD_ORDER:
+        if key in card:
+            ordered[key] = card[key]
+    # Append any unexpected fields at the end
+    for key in card:
+        if key not in ordered:
+            ordered[key] = card[key]
+    return ordered
 
-    Returns:
-        Card with evaluation_summary added.
+
+def _enrich_baseline_results(final_card: Dict[str, Any], eee_metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Enrich baseline_results from EEE evaluation data if empty.
+
+    Does NOT add evaluation_summary to the card — only fills in
+    baseline_results when it's missing or "Not specified".
     """
     eval_summary = eee_metadata.get("evaluation_summary", {})
     if not eval_summary:
         return final_card
 
     card = final_card.get("benchmark_card", final_card)
-    card["evaluation_summary"] = eval_summary
 
-    # Also enrich baseline_results if it's empty or generic
     methodology = card.get("methodology", {})
     baseline = methodology.get("baseline_results", "")
     if not baseline or baseline.lower() in ("not specified", "not specified."):
@@ -164,23 +182,19 @@ def process_single_benchmark(
     try:
         final_state = workflow.invoke(initial_state)
 
-        # Inject evaluation summary and composition metadata into the final card
+        # Enrich baseline_results from EEE data if empty, then reorder fields
         final_card = final_state.get("final_card")
         if final_card and eee_metadata:
-            final_card = _inject_evaluation_summary(final_card, eee_metadata)
+            final_card = _enrich_baseline_results(final_card, eee_metadata)
 
-            # Inject confidence and composition metadata from composer
-            composed_card = final_state.get("composed_card", {})
-            if isinstance(composed_card, dict):
-                comp_meta = composed_card.get("composition_metadata")
-                if comp_meta:
-                    card = final_card.get("benchmark_card", final_card)
-                    card["card_info"] = card.get("card_info", {})
-                    card["card_info"]["confidence"] = comp_meta.get("confidence", {})
-                    card["card_info"]["generation_method"] = comp_meta.get("generation_method")
-                    card["card_info"]["sources_used"] = comp_meta.get("sources_used", {})
+            # Re-order fields to match canonical schema order, then re-save
+            card = final_card.get("benchmark_card", final_card)
+            ordered_card = _reorder_card_fields(card)
+            if "benchmark_card" in final_card:
+                final_card["benchmark_card"] = ordered_card
+            else:
+                final_card = ordered_card
 
-            # Re-save the card with evaluation summary and metadata
             card_filename = f"benchmark_card_{safe_name}.json"
             output_manager.save_benchmark_card(final_card, card_filename)
             logger.info("Saved benchmark card with evaluation summary: %s", card_filename)

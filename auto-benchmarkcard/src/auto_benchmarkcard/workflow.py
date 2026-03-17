@@ -297,11 +297,15 @@ def is_not_specified(value: Any) -> bool:
     Returns:
         True if value represents 'Not specified', False otherwise.
     """
-    if isinstance(value, str) and value == "Not specified":
+    _EMPTY_VALUES = {"not specified", "not specified.", "no information found", "no information found."}
+    if isinstance(value, str) and value.strip().lower() in _EMPTY_VALUES:
         return True
-    if isinstance(value, list) and len(value) == 1 and value[0] == "Not specified":
+    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], str) and value[0].strip().lower() in _EMPTY_VALUES:
         return True
     return False
+
+
+_SKIP_SECTIONS = {"possible_risks", "flagged_fields", "missing_fields", "card_info", "evaluation_summary", "provenance"}
 
 
 def extract_missing_fields(data: Any, prefix: str = "") -> List[str]:
@@ -318,6 +322,8 @@ def extract_missing_fields(data: Any, prefix: str = "") -> List[str]:
 
     if isinstance(data, dict):
         for key, value in data.items():
+            if key in _SKIP_SECTIONS:
+                continue
             current_path = f"{prefix}.{key}" if prefix else key
 
             if is_not_specified(value):
@@ -534,18 +540,53 @@ def _apply_deterministic_overrides(
 ) -> Dict[str, Any]:
     """Apply deterministic HF-extracted values to the benchmark card.
 
-    HF tags are factual metadata; they always take precedence over
-    LLM-generated content for the target fields.
+    Smart override: only replaces LLM-generated content when:
+    - The LLM value is empty, "Not specified", or missing
+    - The field is a "always-override" field (languages, license, data_type)
+
+    Fields like data.size and methodology.metrics are only overridden when
+    the LLM didn't produce a more specific value.
     """
+    # Fields where deterministic tags ALWAYS win (factual identity)
+    _ALWAYS_OVERRIDE = {
+        "benchmark_details.languages",
+        "benchmark_details.data_type",
+        "ethical_and_legal_considerations.data_licensing",
+    }
+
+    _EMPTY = {"not specified", "not specified.", "no information found", ""}
+
     for dotted_key, override_val in overrides.items():
         section, _, field = dotted_key.partition(".")
         if not field or section not in card or not isinstance(card[section], dict):
             continue
 
         old = card[section].get(field)
-        card[section][field] = override_val
-        if old != override_val:
-            logger.debug("HF override %s: %r -> %r", dotted_key, old, override_val)
+
+        # Always override for identity fields
+        if dotted_key in _ALWAYS_OVERRIDE:
+            card[section][field] = override_val
+            if old != override_val:
+                logger.debug("HF override (always) %s: %r -> %r", dotted_key, old, override_val)
+            continue
+
+        # For other fields, only override if LLM value is empty/generic
+        llm_is_empty = False
+        if old is None:
+            llm_is_empty = True
+        elif isinstance(old, str) and old.strip().lower() in _EMPTY:
+            llm_is_empty = True
+        elif isinstance(old, list) and (
+            not old
+            or (len(old) == 1 and isinstance(old[0], str) and old[0].strip().lower() in _EMPTY)
+        ):
+            llm_is_empty = True
+
+        if llm_is_empty:
+            card[section][field] = override_val
+            logger.debug("HF override (fill) %s: %r -> %r", dotted_key, old, override_val)
+        else:
+            logger.debug("HF override skipped %s: LLM has specific value %r", dotted_key, str(old)[:80])
 
     return card
 

@@ -298,47 +298,14 @@ def extract_facts_from_hf_readme(
     """Extract facts from HF README using heavy model. Source-isolated.
 
     Only the HF README is provided — no paper or EEE data.
-    For large READMEs (>4000 chars), uses RAG retrieval for comprehensive coverage.
+    Sends the full README text (capped at 15K chars) — no RAG needed
+    since READMEs are short enough for the context window.
     """
     readme = _get_hf_readme(hf_metadata)
     if not readme or len(readme) < 100:
         return ""
 
-    # For large READMEs, use RAG-retrieved chunks for better coverage
-    if hf_retriever and len(readme) > 4000:
-        seen = set()
-        all_chunks = []
-        for queries in SECTION_QUERIES.values():
-            for sq in queries:
-                try:
-                    for chunk in hf_retriever.invoke(sq):
-                        key = chunk.page_content[:200]
-                        if key not in seen:
-                            seen.add(key)
-                            all_chunks.append(chunk)
-                except Exception:
-                    pass
-
-        if all_chunks:
-            budget = 8000
-            used = 0
-            parts = []
-            for chunk in all_chunks:
-                text = chunk.page_content
-                if used + len(text) > budget:
-                    remaining = budget - used
-                    if remaining > 100:
-                        parts.append(text[:remaining])
-                    break
-                parts.append(text)
-                used += len(text)
-            hf_content = "\n\n".join(parts)
-            logger.info("HF README: %d RAG chunks, %d chars for extraction", len(all_chunks), used)
-        else:
-            hf_content = readme[:8000]
-    else:
-        # Short READMEs: use full text (no truncation for reasonable sizes)
-        hf_content = readme[:8000]
+    hf_content = readme[:15000]
 
     prompt = HF_README_EXTRACTION_PROMPT.format(
         benchmark_name=benchmark_name,
@@ -983,34 +950,56 @@ def apply_deterministic_overrides(
 ) -> Dict[str, Any]:
     """Override LLM-generated fields with deterministic values where available.
 
-    These are ground-truth values from structured sources (EEE, HF tags)
-    that should always take precedence over LLM-generated content.
+    Smart override strategy:
+    - Always override: languages, license (factual identity, LLM often wrong)
+    - Fill-only: metrics, format (only if LLM value is empty/generic)
     """
     overrides_applied = []
 
-    # Override metrics from EEE
-    if "methodology.metrics" in deterministic_facts:
-        eee_metrics = deterministic_facts["methodology.metrics"]
-        if eee_metrics and card.get("methodology"):
-            card["methodology"]["metrics"] = eee_metrics
-            overrides_applied.append("metrics")
+    _EMPTY = {"not specified", "not specified.", "no information found", ""}
 
-    # Override languages from HF
+    def _is_empty(val):
+        if val is None:
+            return True
+        if isinstance(val, str) and val.strip().lower() in _EMPTY:
+            return True
+        if isinstance(val, list) and (
+            not val or (len(val) == 1 and isinstance(val[0], str) and val[0].strip().lower() in _EMPTY)
+        ):
+            return True
+        return False
+
+    # Always override: languages from HF (factual)
     if "benchmark_details.languages" in deterministic_facts:
         card.setdefault("benchmark_details", {})["languages"] = \
             deterministic_facts["benchmark_details.languages"]
         overrides_applied.append("languages")
 
-    # Override license from HF
+    # Always override: license from HF (factual)
     if "ethical_and_legal_considerations.data_licensing" in deterministic_facts:
         card.setdefault("ethical_and_legal_considerations", {})["data_licensing"] = \
             deterministic_facts["ethical_and_legal_considerations.data_licensing"]
         overrides_applied.append("license")
 
-    # Override format from HF
+    # Fill-only: metrics from EEE (only if LLM didn't produce specific metrics)
+    if "methodology.metrics" in deterministic_facts:
+        eee_metrics = deterministic_facts["methodology.metrics"]
+        if eee_metrics and card.get("methodology"):
+            existing = card["methodology"].get("metrics")
+            if _is_empty(existing):
+                card["methodology"]["metrics"] = eee_metrics
+                overrides_applied.append("metrics")
+            else:
+                logger.debug("Skipping metrics override: LLM has %r", existing)
+
+    # Fill-only: format from HF (only if LLM didn't produce specific format)
     if "data.format" in deterministic_facts:
-        card.setdefault("data", {})["format"] = deterministic_facts["data.format"]
-        overrides_applied.append("format")
+        existing = card.get("data", {}).get("format")
+        if _is_empty(existing):
+            card.setdefault("data", {})["format"] = deterministic_facts["data.format"]
+            overrides_applied.append("format")
+        else:
+            logger.debug("Skipping format override: LLM has %r", existing)
 
     # Enrich resources with deterministic URLs
     resources = card.get("benchmark_details", {}).get("resources", [])
@@ -1340,7 +1329,7 @@ def compose_benchmark_card(
     logger.info("Available sources: %s", ", ".join(source_list) or "none")
 
     # =====================================================================
-    # PHASE 1: RAG-lite — collect paper chunks
+    # PHASE 1: Collect paper content — intro guaranteed + RAG supplement
     # =====================================================================
     paper_retriever = None
     all_paper_content = ""
@@ -1348,53 +1337,66 @@ def compose_benchmark_card(
     if has_paper:
         paper_text = docling_output.get("filtered_text", "")
         if paper_text:
-            try:
-                if Config.DEFAULT_EMBEDDING_MODEL == "bge-large":
-                    embeddings = HuggingFaceEmbeddings(
-                        model_name="BAAI/bge-large-en-v1.5",
-                        model_kwargs={"device": "cpu"},
-                        encode_kwargs={"normalize_embeddings": True},
-                    )
-                elif Config.DEFAULT_EMBEDDING_MODEL == "e5-large":
-                    embeddings = HuggingFaceEmbeddings(
-                        model_name="intfloat/e5-large-v2",
-                        model_kwargs={"device": "cpu"},
-                        encode_kwargs={"normalize_embeddings": True},
-                    )
-                else:
-                    embeddings = HuggingFaceEmbeddings(
-                        model_name="sentence-transformers/all-MiniLM-L6-v2"
-                    )
+            budget = Config.PAPER_EXTRACTION_BUDGET
+            intro_chars = Config.PAPER_INTRO_CHARS
 
-                splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=1000, chunk_overlap=200,
-                    separators=["\n\n", "\n", ". ", " "],
-                )
-                chunks = splitter.split_text(paper_text)
-                documents = [
-                    Document(page_content=c, metadata={"chunk_idx": i})
-                    for i, c in enumerate(chunks)
-                ]
-                paper_vectorstore = Chroma.from_documents(documents, embeddings)
-                paper_retriever = paper_vectorstore.as_retriever(search_kwargs={"k": 5})
-                logger.debug("Paper indexed: %d chunks", len(chunks))
+            # Step 1: Always include the abstract + introduction
+            intro_text = paper_text[:intro_chars]
 
-                # Collect chunks across ALL sections for comprehensive extraction
-                seen = set()
-                all_chunks = []
-                for queries in SECTION_QUERIES.values():
-                    for sq in queries:
-                        for chunk in paper_retriever.get_relevant_documents(sq):
-                            key = chunk.page_content[:200]
-                            if key not in seen:
+            # Short papers: send the whole thing, no RAG needed
+            if len(paper_text) <= budget:
+                all_paper_content = paper_text
+                logger.info("Paper fits in budget (%d chars), using full text", len(paper_text))
+            else:
+                # Step 2: Index paper for RAG retrieval (also used by gap-filling later)
+                try:
+                    if Config.DEFAULT_EMBEDDING_MODEL == "bge-large":
+                        embeddings = HuggingFaceEmbeddings(
+                            model_name="BAAI/bge-large-en-v1.5",
+                            model_kwargs={"device": "cpu"},
+                            encode_kwargs={"normalize_embeddings": True},
+                        )
+                    elif Config.DEFAULT_EMBEDDING_MODEL == "e5-large":
+                        embeddings = HuggingFaceEmbeddings(
+                            model_name="intfloat/e5-large-v2",
+                            model_kwargs={"device": "cpu"},
+                            encode_kwargs={"normalize_embeddings": True},
+                        )
+                    else:
+                        embeddings = HuggingFaceEmbeddings(
+                            model_name="sentence-transformers/all-MiniLM-L6-v2"
+                        )
+
+                    splitter = RecursiveCharacterTextSplitter(
+                        chunk_size=1000, chunk_overlap=200,
+                        separators=["\n\n", "\n", ". ", " "],
+                    )
+                    chunks = splitter.split_text(paper_text)
+                    documents = [
+                        Document(page_content=c, metadata={"chunk_idx": i})
+                        for i, c in enumerate(chunks)
+                    ]
+                    paper_vectorstore = Chroma.from_documents(documents, embeddings)
+                    paper_retriever = paper_vectorstore.as_retriever(search_kwargs={"k": 5})
+                    logger.debug("Paper indexed: %d chunks", len(chunks))
+
+                    # Step 3: RAG-retrieve additional chunks, skip those overlapping intro
+                    seen = set()
+                    rag_chunks = []
+                    for queries in SECTION_QUERIES.values():
+                        for sq in queries:
+                            for chunk in paper_retriever.get_relevant_documents(sq):
+                                key = chunk.page_content[:200]
+                                # Skip chunks already covered by the intro
+                                if key in seen or chunk.page_content[:100] in intro_text:
+                                    continue
                                 seen.add(key)
-                                all_chunks.append(chunk)
+                                rag_chunks.append(chunk)
 
-                if all_chunks:
-                    formatted = []
-                    budget = 12000
-                    used = 0
-                    for i, chunk in enumerate(all_chunks, 1):
+                    # Step 4: Combine intro + RAG chunks within budget
+                    formatted = [f"[Abstract and Introduction]\n{intro_text}"]
+                    used = len(intro_text)
+                    for i, chunk in enumerate(rag_chunks, 1):
                         text = chunk.page_content
                         if used + len(text) > budget:
                             remaining = budget - used
@@ -1404,14 +1406,17 @@ def compose_benchmark_card(
                         formatted.append(f"[Section {i}]\n{text}")
                         used += len(text)
                     all_paper_content = "\n\n".join(formatted)
-                    logger.info("Paper: %d unique chunks, %d chars for extraction", len(all_chunks), used)
-            except Exception as e:
-                logger.warning("Paper retrieval failed: %s", e)
+                    logger.info(
+                        "Paper: %d intro chars + %d RAG chunks, %d total chars for extraction",
+                        len(intro_text), len(rag_chunks), used,
+                    )
+                except Exception as e:
+                    logger.warning("Paper retrieval failed: %s", e)
 
-        # Fallback: raw truncated paper text
-        if not all_paper_content and paper_text:
-            all_paper_content = paper_text[:12000]
-            logger.info("Using raw paper text (truncated to 12000 chars)")
+            # Fallback: raw truncated paper text (intro always included)
+            if not all_paper_content and paper_text:
+                all_paper_content = paper_text[:budget]
+                logger.info("Using raw paper text (truncated to %d chars)", budget)
 
     # =====================================================================
     # PHASE 2: Source-isolated extraction
@@ -1428,40 +1433,10 @@ def compose_benchmark_card(
         paper_facts = extract_facts_from_paper(all_paper_content, query, identity_anchor)
 
     # 2b. Extract from HF README (1 LLM call, heavy model)
-    # For large READMEs, RAG-index them like papers for better coverage
+    # Full README sent directly — no RAG needed for README-sized text
     hf_facts = ""
-    hf_retriever = None
     if has_hf_readme:
-        readme_text = _get_hf_readme(hf_metadata)
-        if readme_text and len(readme_text) > 4000:
-            try:
-                if Config.DEFAULT_EMBEDDING_MODEL == "bge-large":
-                    hf_embeddings = HuggingFaceEmbeddings(
-                        model_name="BAAI/bge-large-en-v1.5",
-                        model_kwargs={"device": "cpu"},
-                        encode_kwargs={"normalize_embeddings": True},
-                    )
-                else:
-                    hf_embeddings = HuggingFaceEmbeddings(
-                        model_name="sentence-transformers/all-MiniLM-L6-v2"
-                    )
-
-                hf_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=800, chunk_overlap=150,
-                    separators=["\n\n", "\n", ". ", " "],
-                )
-                hf_chunks = hf_splitter.split_text(readme_text)
-                hf_documents = [
-                    Document(page_content=c, metadata={"chunk_idx": i, "source": "hf_readme"})
-                    for i, c in enumerate(hf_chunks)
-                ]
-                hf_vectorstore = Chroma.from_documents(hf_documents, hf_embeddings)
-                hf_retriever = hf_vectorstore.as_retriever(search_kwargs={"k": 4})
-                logger.info("HF README indexed: %d chunks (%d chars)", len(hf_chunks), len(readme_text))
-            except Exception as e:
-                logger.warning("HF README indexing failed, using raw text: %s", e)
-
-        hf_facts = extract_facts_from_hf_readme(hf_metadata, query, hf_retriever, identity_anchor)
+        hf_facts = extract_facts_from_hf_readme(hf_metadata, query, identity_anchor=identity_anchor)
 
     # 2c. Deterministic extraction (no LLM)
     det_facts = extract_deterministic_facts(eee_metadata, hf_metadata, extracted_ids)
@@ -1494,13 +1469,6 @@ def compose_benchmark_card(
     if paper_facts and paper_retriever:
         paper_facts = _fill_paper_gaps(
             paper_facts, paper_retriever, query, full_paper_text or all_paper_content
-        )
-
-    # Also gap-fill from HF README if it was indexed
-    if hf_facts and hf_retriever:
-        readme_text = _get_hf_readme(hf_metadata)
-        hf_facts = _fill_paper_gaps(
-            hf_facts, hf_retriever, query, readme_text or ""
         )
 
     # =====================================================================
