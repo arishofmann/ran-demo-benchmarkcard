@@ -30,6 +30,39 @@ from ai_atlas_nexus.library import AIAtlasNexus
 logger = logging.getLogger(__name__)
 
 
+def _load_benchmark_cot_examples(taxonomy: str = "ibm-risk-atlas") -> Optional[List]:
+    """Load benchmark-specific CoT examples from the risk atlas nexus data.
+
+    Maps taxonomy IDs to the keys used in the CoT JSON file and returns
+    the examples list for the FewShotPromptBuilder.
+    """
+    try:
+        from ai_atlas_nexus.data import load_resource
+
+        cot_data = load_resource("risk_generation_cot.json")
+
+        # Map our taxonomy ID to the key in the CoT file
+        taxonomy_map = {
+            "ibm-risk-atlas": "ibm-risk-atlas",
+            "ibm-ai-risk-atlas": "ibm-risk-atlas",
+        }
+        key = taxonomy_map.get(taxonomy, taxonomy)
+        examples = cot_data.get(key)
+
+        if examples:
+            # Filter to only benchmark examples (those with Reasoning field)
+            benchmark_examples = [ex for ex in examples if "Reasoning" in ex]
+            if benchmark_examples:
+                logger.info("Loaded %d benchmark CoT examples for %s", len(benchmark_examples), taxonomy)
+                return benchmark_examples
+
+        logger.debug("No benchmark CoT examples found for taxonomy: %s", taxonomy)
+        return None
+    except Exception as e:
+        logger.debug("Could not load CoT examples: %s", e)
+        return None
+
+
 def identify_risks_with_benchmark_detector(
     ai_atlas_nexus: AIAtlasNexus,
     usecases: List[str],
@@ -63,11 +96,14 @@ def identify_risks_with_benchmark_detector(
         # Get all risks for the specified taxonomy
         all_risks = ai_atlas_nexus.get_all_risks(taxonomy)
 
+        # Load benchmark-specific CoT examples
+        cot_examples = _load_benchmark_cot_examples(taxonomy)
+
         # Create the custom benchmark risk detector
         benchmark_detector = BenchmarkRiskDetector(
             risks=all_risks,
             inference_engine=inference_engine,
-            cot_examples=None,  # Using zero-shot for now
+            cot_examples=cot_examples,
             max_risk=max_risk,
         )
 
@@ -186,7 +222,10 @@ def identify_risks_from_benchmark_metadata(
 
 
 def create_usecase_from_benchmark_card(benchmark_card: Dict[str, Any]) -> Optional[str]:
-    """Create a usecase description from benchmark card metadata.
+    """Create a rich usecase description from benchmark card metadata.
+
+    Includes data source, methodology, and limitations to enable
+    more targeted risk identification.
 
     Args:
         benchmark_card: The benchmark card containing metadata.
@@ -194,45 +233,90 @@ def create_usecase_from_benchmark_card(benchmark_card: Dict[str, Any]) -> Option
     Returns:
         Usecase description string or None if insufficient data.
     """
+    _EMPTY = {"not specified", "not specified.", "no information found", ""}
+
+    def _is_specified(val) -> bool:
+        if val is None:
+            return False
+        if isinstance(val, str):
+            return val.strip().lower() not in _EMPTY
+        if isinstance(val, list):
+            return bool(val) and not (
+                len(val) == 1 and isinstance(val[0], str) and val[0].strip().lower() in _EMPTY
+            )
+        return bool(val)
+
+    def _join_list(val) -> str:
+        if isinstance(val, list):
+            return ", ".join(str(v) for v in val)
+        return str(val)
+
     try:
-        # Extract key information from benchmark card
         details = benchmark_card.get("benchmark_details", {})
         purpose = benchmark_card.get("purpose_and_intended_users", {})
+        data = benchmark_card.get("data", {})
+        methodology = benchmark_card.get("methodology", {})
+        ethical = benchmark_card.get("ethical_and_legal_considerations", {})
 
         name = details.get("name", "")
         overview = details.get("overview", "")
         domains = details.get("domains", [])
+        languages = details.get("languages", [])
         tasks = purpose.get("tasks", [])
         goal = purpose.get("goal", "")
+        limitations = purpose.get("limitations", "")
 
-        # Build usecase description similar to the example format
-        usecase_parts = []
+        data_source = data.get("source", "")
+        data_size = data.get("size", "")
+        annotation = data.get("annotation", "")
+
+        methods = methodology.get("methods", [])
+        metrics = methodology.get("metrics", [])
+        license_info = ethical.get("data_licensing", "")
+
+        parts = []
 
         if name:
-            usecase_parts.append(f"{name} is a benchmark.")
+            parts.append(f"{name} is a benchmark")
 
-        if overview:
-            usecase_parts.append(f"{overview.lower()}")
+        if _is_specified(overview):
+            parts.append(overview)
 
-        if goal:
-            usecase_parts.append(f"with the goal of {goal.lower()}")
+        if _is_specified(goal):
+            parts.append(f"The goal is {goal}")
 
-        # Add domains if available
-        if isinstance(domains, list) and domains:
-            domain_str = ", ".join(domains) if len(domains) > 1 else domains[0]
-            usecase_parts.append(f"Domains: {domain_str}")
-        elif isinstance(domains, str) and domains:
-            usecase_parts.append(f"Domains: {domains}")
+        if _is_specified(data_source):
+            parts.append(f"The data was sourced from: {data_source}")
 
-        # Add tasks if available
-        if isinstance(tasks, list) and tasks:
-            task_str = ", ".join(tasks) if len(tasks) > 1 else tasks[0]
-            usecase_parts.append(f"Tasks: {task_str}")
-        elif isinstance(tasks, str) and tasks:
-            usecase_parts.append(f"Tasks: {tasks}")
+        if _is_specified(data_size):
+            parts.append(f"Dataset size: {data_size}")
 
-        if usecase_parts:
-            usecase = ". ".join(usecase_parts).strip()
+        if _is_specified(annotation):
+            parts.append(f"Annotation: {annotation}")
+
+        if _is_specified(methods):
+            parts.append(f"Evaluation methods: {_join_list(methods)}")
+
+        if _is_specified(metrics):
+            parts.append(f"Metrics: {_join_list(metrics)}")
+
+        if _is_specified(languages):
+            parts.append(f"Languages: {_join_list(languages)}")
+
+        if _is_specified(domains):
+            parts.append(f"Domains: {_join_list(domains)}")
+
+        if _is_specified(tasks):
+            parts.append(f"Tasks: {_join_list(tasks)}")
+
+        if _is_specified(limitations):
+            parts.append(f"Known limitations: {limitations}")
+
+        if _is_specified(license_info):
+            parts.append(f"Data license: {license_info}")
+
+        if parts:
+            usecase = ". ".join(parts).strip()
             if not usecase.endswith("."):
                 usecase += "."
             return usecase
@@ -261,16 +345,13 @@ def integrate_risks_into_benchmark_card(
         # Make a copy to avoid modifying the original
         updated_card = benchmark_card.copy()
 
-        # Remove id and tag fields from risks
+        # Keep only category, description, and url
         cleaned_risks = []
         for risk in risks:
             cleaned_risk = {
                 "category": risk["category"],
                 "description": risk["description"],
-                "type": risk["type"],
-                "concern": risk["concern"],
-                "url": risk["url"] if risk["url"] else None,
-                "taxonomy": risk["taxonomy"],
+                "url": risk.get("url") or None,
             }
             cleaned_risks.append(cleaned_risk)
 
