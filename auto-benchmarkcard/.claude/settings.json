@@ -3,7 +3,8 @@
     "allow": [
       "Bash(python3 -c \":*)",
       "Bash(python3 -m auto_benchmarkcard process-eee external/eee_samples --benchmarks \"IFEval\" --output output/quality_v4)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(python -c \":*)"
     ]
   }
 }

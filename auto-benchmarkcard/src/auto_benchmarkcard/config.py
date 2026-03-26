@@ -119,6 +119,7 @@ def get_llm_handler(model_name: Optional[str] = None):
             _llm_cache[key] = LLMHandler(
                 engine_type=Config.LLM_ENGINE_TYPE,
                 model_name=key,
+                parameters={"temperature": 0.15},
                 verbose=False,
             )
         except Exception as e:
