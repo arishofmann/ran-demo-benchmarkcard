@@ -13,7 +13,7 @@ retriever = RAGRetriever(
     enable_llm_reranking=True,        # Quality filtering with LLM
     enable_hybrid_search=True,        # Vector + BM25 search
     enable_query_expansion=True,      # Query reformulation
-    llm_engine_type="RITS"           # or "OLLAMA"
+    llm_engine_type="hf"           # or "OLLAMA"
 )
 
 retriever.index_documents(documents)
@@ -32,7 +32,7 @@ documents = indexer.create_documents(unitxt_data, hf_data, benchmark_name, docli
 Breaks benchmark cards into atomic factual statements for verification.
 
 ```python
-statements = atomize_benchmark_card(benchmark_card, engine_type="rits")
+statements = atomize_benchmark_card(benchmark_card, engine_type="hf")
 # Returns: [{"text": "The dataset contains 70,000 examples", "field": "data.size"}, ...]
 ```
 

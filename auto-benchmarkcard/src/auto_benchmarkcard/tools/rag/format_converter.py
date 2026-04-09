@@ -1,3 +1,5 @@
+"""Conversion utilities for RAG results and atomic statement formatting."""
+
 import json
 import logging
 import re

@@ -1,28 +1,10 @@
 """AI Atlas Nexus integration for AI risk identification.
 
-This module integrates the AI Atlas Nexus library to automatically identify
-relevant AI risks based on benchmark metadata. It creates use case descriptions
-from benchmark cards and applies risk detection models to map benchmarks to
-specific risks in the IBM AI Risk Atlas taxonomy.
-
-Key functionality:
-- Use case generation from benchmark card metadata
-- Risk identification using BenchmarkRiskDetector
-- Integration with RITS inference engine for risk classification
-- Filtering and ranking of detected risks
+Maps benchmark metadata to known AI risks using the BenchmarkRiskDetector.
 """
 
 import logging
-import os
 from typing import Any, Dict, List, Optional
-
-# Suppress noisy logging from external libraries
-logging.getLogger("httpx").setLevel(logging.ERROR)
-logging.getLogger("httpcore").setLevel(logging.ERROR)
-logging.getLogger("litellm").setLevel(logging.ERROR)
-logging.getLogger("LiteLLM").setLevel(logging.ERROR)
-logging.getLogger("openai").setLevel(logging.ERROR)
-logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 from ai_atlas_nexus.blocks.risk_detector import BenchmarkRiskDetector
 from ai_atlas_nexus.library import AIAtlasNexus
@@ -31,17 +13,12 @@ logger = logging.getLogger(__name__)
 
 
 def _load_benchmark_cot_examples(taxonomy: str = "ibm-risk-atlas") -> Optional[List]:
-    """Load benchmark-specific CoT examples from the risk atlas nexus data.
-
-    Maps taxonomy IDs to the keys used in the CoT JSON file and returns
-    the examples list for the FewShotPromptBuilder.
-    """
+    """Load benchmark-specific chain-of-thought examples for few-shot risk detection."""
     try:
         from ai_atlas_nexus.data import load_resource
 
         cot_data = load_resource("risk_generation_cot.json")
 
-        # Map our taxonomy ID to the key in the CoT file
         taxonomy_map = {
             "ibm-risk-atlas": "ibm-risk-atlas",
             "ibm-ai-risk-atlas": "ibm-risk-atlas",
@@ -50,7 +27,6 @@ def _load_benchmark_cot_examples(taxonomy: str = "ibm-risk-atlas") -> Optional[L
         examples = cot_data.get(key)
 
         if examples:
-            # Filter to only benchmark examples (those with Reasoning field)
             benchmark_examples = [ex for ex in examples if "Reasoning" in ex]
             if benchmark_examples:
                 logger.info("Loaded %d benchmark CoT examples for %s", len(benchmark_examples), taxonomy)
@@ -70,36 +46,11 @@ def identify_risks_with_benchmark_detector(
     taxonomy: str = "ibm-ai-risk-atlas",
     max_risk: Optional[int] = None,
 ) -> List[List]:
-    """Identify risks using the custom BenchmarkRiskDetector.
-
-    Uses a specialized risk detector that matches benchmark use cases to
-    known AI risks in the specified taxonomy. Returns ranked risks based
-    on relevance to the provided use cases.
-
-    Args:
-        ai_atlas_nexus: AIAtlasNexus library instance.
-        usecases: List of use case descriptions from benchmark metadata.
-        inference_engine: Inference engine for risk classification.
-        taxonomy: Risk taxonomy identifier (default: "ibm-ai-risk-atlas").
-        max_risk: Maximum number of risks to return per use case.
-
-    Returns:
-        List of Risk object lists, one list per input use case.
-
-    Example:
-        >>> risks = identify_risks_with_benchmark_detector(
-        ...     ran, ["Hate speech detection in social media"],
-        ...     engine, max_risk=5
-        ... )
-    """
+    """Match benchmark use cases to known AI risks using the BenchmarkRiskDetector."""
     try:
-        # Get all risks for the specified taxonomy
         all_risks = ai_atlas_nexus.get_all_risks(taxonomy)
-
-        # Load benchmark-specific CoT examples
         cot_examples = _load_benchmark_cot_examples(taxonomy)
 
-        # Create the custom benchmark risk detector
         benchmark_detector = BenchmarkRiskDetector(
             risks=all_risks,
             inference_engine=inference_engine,
@@ -107,7 +58,6 @@ def identify_risks_with_benchmark_detector(
             max_risk=max_risk,
         )
 
-        # Detect risks using the benchmark-specific detector
         return benchmark_detector.detect(usecases)
 
     except Exception as e:
@@ -116,73 +66,36 @@ def identify_risks_with_benchmark_detector(
 
 
 def create_inference_engine():
-    """Create a RITS inference engine for risk identification.
-
-    Uses LLMHandler to create the engine, ensuring consistent configuration
-    and verbose settings across the application.
-
-    Returns:
-        RITSInferenceEngine instance if successful, None otherwise.
-    """
+    """Create an inference engine for risk classification using the configured LLM backend."""
     try:
-        from auto_benchmarkcard.llm_handler import LLMHandler
+        from auto_benchmarkcard.config import get_llm_handler, Config
 
-        # Create handler with RITS engine for risk identification
-        handler = LLMHandler(
-            engine_type="rits",
-            model_name="meta-llama/llama-3-3-70b-instruct",
-            credentials={
-                "api_key": os.getenv("RITS_API_KEY"),
-                "api_url": os.getenv("RITS_API_URL"),
-            },
-            parameters={"max_completion_tokens": 1000, "temperature": 0.7},
-            verbose=False  # Disable progress bars for cleaner output
-        )
-
-        # Return the underlying ai-atlas-nexus engine
-        # BenchmarkRiskDetector needs the raw engine, not the wrapper
+        handler = get_llm_handler(Config.COMPOSER_MODEL)
         return handler.engine
-
     except Exception as e:
-        logger.warning("Failed to create RITS inference engine: %s", e)
-        logger.warning(
-            "Risk identification will be skipped. Set RITS_API_KEY and RITS_API_URL environment variables."
-        )
+        logger.warning("Failed to create inference engine for risk identification: %s", e)
+        logger.warning("Risk identification will be skipped.")
         return None
 
 
 def identify_risks_from_benchmark_metadata(
     benchmark_card: Dict[str, Any], taxonomy: str = "ibm-risk-atlas", max_risk: int = 5
 ) -> Optional[List[Dict[str, Any]]]:
-    """Identify risks from benchmark metadata using AI Atlas Nexus.
-
-    Args:
-        benchmark_card: The composed benchmark card containing metadata.
-        taxonomy: The risk taxonomy to use (default: "ibm-risk-atlas").
-        max_risk: Maximum number of risks to identify (default: 5).
-
-    Returns:
-        List of risk dictionaries or None if identification fails.
-    """
+    """Identify AI risks from benchmark metadata using AI Atlas Nexus."""
     try:
-        # Create inference engine
         inference_engine = create_inference_engine()
         if not inference_engine:
             logger.warning("No inference engine available - skipping risk identification")
             return None
 
-        # Create AI Atlas Nexus instance
         ai_atlas_nexus = AIAtlasNexus()
-
-        # Extract usecase description from benchmark metadata
         usecase = create_usecase_from_benchmark_card(benchmark_card)
         if not usecase:
             logger.warning("Could not create usecase description from benchmark card")
             return None
 
-        logger.debug("🔄 Identifying potential AI risks...")
+        logger.debug("Identifying potential AI risks...")
 
-        # Use custom benchmark risk detector instead of generic one
         risks = identify_risks_with_benchmark_detector(
             ai_atlas_nexus=ai_atlas_nexus,
             usecases=[usecase],
@@ -191,11 +104,9 @@ def identify_risks_from_benchmark_metadata(
             max_risk=max_risk,
         )
 
-        # Extract the first (and only) result from the nested list structure
         if risks and len(risks) > 0 and len(risks[0]) > 0:
-            risk_objects = risks[0][:max_risk]  # Get first usecase's risks, limited to max_risk
+            risk_objects = risks[0][:max_risk]
 
-            # Convert Risk objects to dictionary format for benchmark card
             formatted_risks = []
             for risk_obj in risk_objects:
                 formatted_risk = {
@@ -210,10 +121,10 @@ def identify_risks_from_benchmark_metadata(
                 }
                 formatted_risks.append(formatted_risk)
 
-            logger.debug("✅ Identified %d potential risks", len(formatted_risks))
+            logger.debug("Identified %d potential risks", len(formatted_risks))
             return formatted_risks
         else:
-            logger.debug("✅ No specific risks identified")
+            logger.debug("No specific risks identified")
             return []
 
     except Exception as e:
@@ -222,17 +133,7 @@ def identify_risks_from_benchmark_metadata(
 
 
 def create_usecase_from_benchmark_card(benchmark_card: Dict[str, Any]) -> Optional[str]:
-    """Create a rich usecase description from benchmark card metadata.
-
-    Includes data source, methodology, and limitations to enable
-    more targeted risk identification.
-
-    Args:
-        benchmark_card: The benchmark card containing metadata.
-
-    Returns:
-        Usecase description string or None if insufficient data.
-    """
+    """Build a textual use-case description from benchmark card metadata for risk detection."""
     _EMPTY = {"not specified", "not specified.", "no information found", ""}
 
     def _is_specified(val) -> bool:
@@ -332,20 +233,10 @@ def create_usecase_from_benchmark_card(benchmark_card: Dict[str, Any]) -> Option
 def integrate_risks_into_benchmark_card(
     benchmark_card: Dict[str, Any], risks: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
-    """Integrate identified risks into the benchmark card.
-
-    Args:
-        benchmark_card: The original benchmark card.
-        risks: List of identified risks.
-
-    Returns:
-        Updated benchmark card with risks integrated.
-    """
+    """Add identified risks to the benchmark card under 'possible_risks'."""
     try:
-        # Make a copy to avoid modifying the original
         updated_card = benchmark_card.copy()
 
-        # Keep only category, description, and url
         cleaned_risks = []
         for risk in risks:
             cleaned_risk = {
@@ -355,7 +246,6 @@ def integrate_risks_into_benchmark_card(
             }
             cleaned_risks.append(cleaned_risk)
 
-        # Add risks directly to possible_risks (renamed from targeted_risks)
         updated_card["possible_risks"] = cleaned_risks
 
         logger.debug("Successfully integrated %d risks into benchmark card", len(cleaned_risks))
@@ -366,20 +256,11 @@ def integrate_risks_into_benchmark_card(
         return benchmark_card
 
 
-# Main function that can be called from the workflow
 def identify_and_integrate_risks(benchmark_card: Dict[str, Any]) -> Dict[str, Any]:
-    """Main function to identify risks and integrate them into benchmark card.
-
-    Args:
-        benchmark_card: The composed benchmark card.
-
-    Returns:
-        Updated benchmark card with risks (or original if identification fails).
-    """
+    """Identify AI risks and integrate them into the benchmark card."""
     try:
-        logger.debug("🔄 Running AI Atlas Nexus analysis...")
+        logger.debug("Running AI Atlas Nexus analysis...")
 
-        # Identify risks
         risks = identify_risks_from_benchmark_metadata(benchmark_card)
 
         if risks is None:
@@ -390,10 +271,9 @@ def identify_and_integrate_risks(benchmark_card: Dict[str, Any]) -> Dict[str, An
             logger.debug("No risks identified - returning original benchmark card")
             return benchmark_card
 
-        # Integrate risks into benchmark card
         updated_card = integrate_risks_into_benchmark_card(benchmark_card, risks)
 
-        logger.debug("✅ Risk analysis completed")
+        logger.debug("Risk analysis completed")
         return updated_card
 
     except Exception as e:

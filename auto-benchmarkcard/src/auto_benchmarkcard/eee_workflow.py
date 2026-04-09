@@ -39,27 +39,16 @@ def build_eee_initial_state(
 ) -> Dict[str, Any]:
     """Build initial workflow state from EEE pipeline inputs.
 
-    Pre-populates extracted_ids, hf_repo, and eee_metadata. The orchestrator
-    detects eee_metadata and skips UnitXT + extractor steps automatically.
-
-    Args:
-        benchmark_name: Name of the benchmark.
-        pipeline_inputs: Output from eee_to_pipeline_inputs().
-        output_manager: Output manager for this benchmark.
-
-    Returns:
-        Initial state dict compatible with GraphState.
+    Pre-populates extracted_ids, hf_repo, and eee_metadata so the orchestrator
+    skips UnitXT + extractor steps automatically.
     """
     return {
         "query": benchmark_name,
         "catalog_path": None,
         "output_manager": output_manager,
-        # EEE does not use UnitXT data — orchestrator skips unitxt/extractor
-        # when eee_metadata is present
         "unitxt_json": None,
         "extracted_ids": pipeline_inputs["extracted_ids"],
         "hf_repo": pipeline_inputs["hf_repo"],
-        # Rest starts empty — pipeline fills these
         "hf_json": None,
         "docling_output": None,
         "composed_card": None,
@@ -69,7 +58,6 @@ def build_eee_initial_state(
         "hf_extraction_attempted": False,
         "rag_results": None,
         "factuality_results": None,
-        # EEE metadata is the primary data source
         "eee_metadata": pipeline_inputs["eee_metadata"],
     }
 
@@ -93,7 +81,6 @@ def _reorder_card_fields(card: Dict[str, Any]) -> Dict[str, Any]:
     for key in _CARD_FIELD_ORDER:
         if key in card:
             ordered[key] = card[key]
-    # Append any unexpected fields at the end
     for key in card:
         if key not in ordered:
             ordered[key] = card[key]
@@ -101,11 +88,7 @@ def _reorder_card_fields(card: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _enrich_baseline_results(final_card: Dict[str, Any], eee_metadata: Dict[str, Any]) -> Dict[str, Any]:
-    """Enrich baseline_results from EEE evaluation data if empty.
-
-    Does NOT add evaluation_summary to the card — only fills in
-    baseline_results when it's missing or "Not specified".
-    """
+    """Fill in baseline_results from EEE evaluation data when missing."""
     eval_summary = eee_metadata.get("evaluation_summary", {})
     if not eval_summary:
         return final_card
@@ -145,25 +128,13 @@ def process_single_benchmark(
     base_output_path: Optional[str] = None,
     debug: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Run the full pipeline for a single EEE benchmark.
-
-    Args:
-        benchmark_name: Name of the benchmark to process.
-        pipeline_inputs: Output from eee_to_pipeline_inputs().
-        base_output_path: Optional output directory.
-        debug: Enable debug logging.
-
-    Returns:
-        Final benchmark card dict, or None on failure.
-    """
+    """Run the full pipeline for a single EEE benchmark."""
     safe_name = sanitize_benchmark_name(benchmark_name)
     output_manager = OutputManager(safe_name, base_output_path)
 
-    # Save EEE metadata as tool output
     eee_metadata = pipeline_inputs.get("eee_metadata", {})
     output_manager.save_tool_output(eee_metadata, "eee", f"{safe_name}.json")
 
-    # Try to find paper URL via UnitXT catalog if not already set
     hf_repo = pipeline_inputs.get("hf_repo")
     extracted_ids = pipeline_inputs.get("extracted_ids", {})
     if not extracted_ids.get("paper_url") and hf_repo:
@@ -171,10 +142,7 @@ def process_single_benchmark(
         if unitxt_paper:
             extracted_ids["paper_url"] = unitxt_paper
 
-    # Build initial state
     initial_state = build_eee_initial_state(benchmark_name, pipeline_inputs, output_manager)
-
-    # Run the standard workflow (skips unitxt + extractor automatically)
     workflow = build_workflow()
 
     logger.info("Processing benchmark: %s (hf_repo=%s)", benchmark_name, pipeline_inputs.get("hf_repo"))
@@ -182,12 +150,10 @@ def process_single_benchmark(
     try:
         final_state = workflow.invoke(initial_state)
 
-        # Enrich baseline_results from EEE data if empty, then reorder fields
         final_card = final_state.get("final_card")
         if final_card and eee_metadata:
             final_card = _enrich_baseline_results(final_card, eee_metadata)
 
-            # Re-order fields to match canonical schema order, then re-save
             card = final_card.get("benchmark_card", final_card)
             ordered_card = _reorder_card_fields(card)
             if "benchmark_card" in final_card:
@@ -199,7 +165,6 @@ def process_single_benchmark(
             output_manager.save_benchmark_card(final_card, card_filename)
             logger.info("Saved benchmark card with evaluation summary: %s", card_filename)
 
-        # Log results
         completed = final_state.get("completed", [])
         errors = final_state.get("errors", [])
         logger.info("Completed steps: %s", completed)
@@ -220,27 +185,12 @@ def run_eee_pipeline(
     benchmarks_filter: Optional[List[str]] = None,
     debug: bool = False,
 ) -> Dict[str, Any]:
-    """Run the full EEE-to-BenchmarkCard pipeline.
-
-    Scans EEE data, discovers benchmarks, resolves sources, and generates
-    benchmark cards for each discovered benchmark.
-
-    Args:
-        eee_path: Path to EEE data directory.
-        output_path: Optional base output directory.
-        max_files_per_benchmark: Max eval files to sample per benchmark folder.
-        benchmarks_filter: If set, only process these benchmark names.
-        debug: Enable debug logging.
-
-    Returns:
-        Summary dict with results per benchmark.
-    """
+    """Scan EEE evaluation data, discover benchmarks, and generate cards for each."""
     setup_logging_suppression(debug_mode=debug)
 
-    logger.info("Models — composer: %s | light: %s | factreasoner: %s",
-                Config.COMPOSER_MODEL, Config.LIGHT_MODEL, Config.FACTREASONER_MODEL)
+    logger.info("Models — composer: %s | factreasoner: %s",
+                Config.COMPOSER_MODEL, Config.FACTREASONER_MODEL)
 
-    # Step 1: Scan EEE data
     logger.info("Scanning EEE data at: %s", eee_path)
     scan_result = scan_eee_folder(eee_path, max_files_per_benchmark)
 
@@ -251,7 +201,6 @@ def run_eee_pipeline(
     benchmarks = scan_result.benchmarks
     logger.info("Found %d unique benchmarks in %d files", len(benchmarks), scan_result.total_eval_files)
 
-    # Apply filter if provided
     if benchmarks_filter:
         filter_set = {b.lower() for b in benchmarks_filter}
         benchmarks = {
@@ -260,7 +209,6 @@ def run_eee_pipeline(
         }
         logger.info("Filtered to %d benchmarks: %s", len(benchmarks), list(benchmarks.keys()))
 
-    # Step 2: Prepare pipeline inputs (resolves HF repos)
     logger.info("Resolving HuggingFace repos...")
     pipeline_inputs_map: Dict[str, Dict[str, Any]] = {}
     for name, bench in sorted(benchmarks.items()):
@@ -269,7 +217,6 @@ def run_eee_pipeline(
         hf = inputs.get("hf_repo", "None")
         logger.info("  %s -> hf_repo=%s (%d models)", name, hf, bench.num_models_evaluated)
 
-    # Step 3: Process each benchmark
     summary = {
         "total_benchmarks": len(pipeline_inputs_map),
         "successful": [],
@@ -278,7 +225,7 @@ def run_eee_pipeline(
     }
 
     for i, (name, inputs) in enumerate(sorted(pipeline_inputs_map.items()), 1):
-        logger.info("\n=== [%d/%d] Processing: %s ===", i, len(pipeline_inputs_map), name)
+        logger.info("[%d/%d] Processing: %s", i, len(pipeline_inputs_map), name)
 
         if not inputs.get("hf_repo"):
             logger.warning("Skipping %s: no HF repo resolved", name)
@@ -297,8 +244,7 @@ def run_eee_pipeline(
         else:
             summary["failed"].append(name)
 
-    logger.info("\n=== EEE Pipeline Complete ===")
-    logger.info("Success: %d | Failed: %d | Skipped: %d",
+    logger.info("EEE pipeline complete: success=%d, failed=%d, skipped=%d",
                 len(summary["successful"]), len(summary["failed"]), len(summary["skipped"]))
 
     return summary

@@ -1,260 +1,95 @@
-# Auto-BenchmarkCard: Automated Synthesis of Benchmark Documentation
+# Auto-BenchmarkCard
 
-We present Auto-BenchmarkCard, a workflow for generating validated descriptions of AI benchmarks. Benchmark documentation is often incomplete or inconsistent, making it difficult to interpret and compare benchmarks across tasks or domains. Auto-BenchmarkCard addresses this gap by combining multi-agent data extraction from heterogeneous sources (e.g., Hugging Face, Unitxt, academic papers) with LLM-driven synthesis. A subsequent validation phase evaluates factual accuracy through atomic entailment scoring using the FactReasoner tool. The workflow promotes transparency, comparability, and reusability in AI benchmark reporting, enabling researchers and practitioners to better navigate and evaluate benchmark choices.
+Automated generation of validated benchmark documentation for AI/NLP benchmarks.
 
+Benchmark documentation is often incomplete, inconsistent, or scattered across different sources. Auto-BenchmarkCard pulls together metadata from Hugging Face, Unitxt, and academic papers, synthesizes it into a structured BenchmarkCard using LLMs, and then fact-checks the result against the original sources using [FactReasoner](https://github.com/evaleval/FactReasoner).
 
+<img width="1050" height="335" alt="Auto-BenchmarkCard architecture diagram" src="https://github.com/user-attachments/assets/c4c1992e-b0c9-4a3c-bc5a-89716b9ff215" />
 
-<img width="1050" height="335" alt="Bildschirmfoto 2025-10-17 um 10 38 52" src="https://github.com/user-attachments/assets/c4c1992e-b0c9-4a3c-bc5a-89716b9ff215" />
+## How it works
 
+The workflow has three phases:
 
+**Extraction** gathers raw data from multiple sources. The Unitxt tool fetches benchmark definitions from the Unitxt catalog. The HuggingFace tool loads dataset READMEs and metadata. The Docling tool converts referenced academic papers into structured text.
 
----
+**Composition** takes all extracted data and feeds it to an LLM that produces a structured BenchmarkCard. After that, [AI Atlas Nexus](https://github.com/IBM/risk-atlas-nexus) maps the benchmark to relevant AI risk categories.
 
-The system automates the creation of benchmark documentation through a three-phase workflow.
+**Validation** breaks the generated card into atomic claims, retrieves evidence for each claim using BM25 + vector search + LLM reranking, and sends claim-evidence pairs to FactReasoner. Each claim is classified as supported, contradicted, or neutral with a confidence score. Fields with low factuality or missing evidence get flagged for human review.
 
-**Extraction Phase:** The workflow aggregates metadata from multiple sources including Unitxt, Hugging Face, and academic papers, extracting benchmark identifiers, dataset information, and documentation.
+The whole pipeline is orchestrated as a LangGraph state machine where each tool runs as a worker node.
 
-**Composing Phase:** An LLM-powered composer synthesizes all extracted information into a structured BenchmarkCard, intelligently combining the extracted data into cohesive documentation. Based on that BenchmarkCard, AI Atlas Nexus tags potential risks associated with it.
-
-**Validation Phase:** The generated card is broken down into atomic claims. Search algorithms retrieve relevant evidence for each claim from the extraction phase data, which an LLM reranks and filters for quality. These claim-evidence pairs are then sent to FactReasoner, which classifies them as supported, contradicted, or neutral with confidence scores. Sections with low factuality scores or missing evidence are flagged for human review through the BenchmarkCard Editor, enabling iterative refinement until publication-ready documentation is achieved.
-
-Each component acts as a "worker" in the LangGraph workflow, with graph state updated at each stage to maintain seamless data flow throughout the pipeline.
-
----
-
-## Tools Overview
-
-### Unitxt Tool
-- Fetches benchmark metadata from the Unitxt catalog, a unified framework providing standardized NLP benchmarks
-- Retrieves all referenced components including metrics, templates, datasets, and task definitions
-- Supports hundreds of benchmarks spanning classification, QA, NLI, summarization, and other NLP tasks
-- Caches results for efficiency
-
-### Extractor Tool
-- Extracts Hugging Face repo names, paper URLs, and risk-related tags
-
-### HuggingFace Tool
-- Loads dataset READMEs, configuration files, and builder metadata
-
-### Docling Tool
-- Converts academic papers into filtered Markdown content
-
-### Composer Tool
-- Uses an LLM to generate structured BenchmarkCards from available data
-
-### AI Atlas Nexus Tool
-- Maps benchmarks to AI risk categories using IBM Risk Atlas
-
-### RAG Tool
-- Retrieves evidence using a mix of BM25, vector search, and LLM reranking
-
-### FactReasoner Tool
-- Verifies the factual correctness of atomic statements using retrieved evidence
-
----
-
-## Data Flow
-
-1. Input: Benchmark name (e.g., `glue`)
-2. Unitxt Lookup: Get core metadata and dependencies
-3. ID Extraction: Find HF repo and paper URLs
-4. Hugging Face Metadata: Extract dataset info
-5. Paper Extraction: Download and process relevant paper
-6. Card Composition: Use LLM to generate the card
-7. Risk Assessment: Analyze benchmark risks
-8. Evidence Retrieval: RAG tool finds supporting content
-9. Fact Verification: Validate benchmark claims
-10. Output: Final benchmark card
-
----
-
-## Output Structure
-
-The system creates a timestamped, organized directory structure for each benchmark processing session:
-
-```
-output/
-└── <benchmark_name>_<timestamp>/
-    ├── tool_output/                 # All tool outputs and analysis results
-    │   ├── unitxt/                  # UnitXT benchmark definitions
-    │   ├── hf/                      # Hugging Face dataset metadata
-    │   ├── docling/                 # Processed academic papers
-    │   ├── extractor/               # Extracted IDs and URLs
-    │   ├── risk_enhanced/           # Risk-enhanced benchmark cards
-    │   ├── rag/                     # Evidence retrieval and atomic statements
-    │   ├── factreasoner/            # Factuality verification scores
-    │   └── ai_atlas_nexus/        # AI risk assessment results
-    └── auto_benchmarkcard/               # Final benchmark cards
-        └── benchmark_card_<name>.json         # Complete card with flagged fields section
-```
-
-Example session directory: `output/hellaswag_2025-01-08_14-30/`
-
----
-
-## Getting Started
-
-### Prerequisites
-
-- Python 3.9+
-- macOS with Homebrew (for Merlin compilation)
-- Git
-
----
-
-## Setup Instructions
-
-Create a `.env` file in the root `auto_benchmarkcard/` directory.
-
-The system supports multiple LLM inference engines (configured in `src/auto_benchmarkcard/config.py`):
-- RITS (IBM Research Internal) - Default
-- Ollama (Local inference)
-- vLLM
-- WML (Watson Machine Learning)
-
-Set `LLM_ENGINE_TYPE` in `config.py` to switch between engines.
-
-**Example for RITS:**
-```bash
-RITS_API_KEY=<RITS_API_KEY>
-RITS_MODEL=<YOUR_MODEL>
-RITS_API_URL=<RITS_API_URL>
-```
-
-Install the package:
+## Quick start
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+git clone https://github.com/evaleval/auto-benchmarkcard.git
+cd auto-benchmarkcard
+python -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
 
-### Step 2: Setup External Dependencies
+Create a `.env` file:
 
-1. Clone Merlin:
 ```bash
-git clone https://github.com/arishofmann/merlin.git external/merlin
+LLM_ENGINE_TYPE=hf
+HF_TOKEN=<your-hf-token>
+HF_COMPOSER_MODEL=deepseek-ai/DeepSeek-V3.1
+FACTREASONER_MODEL=meta-llama/Llama-3.3-70B-Instruct
 ```
 
-### Step 3: Setup Merlin (for FactReasoner)
+Generate a benchmark card:
 
 ```bash
+benchmarkcard generate-unitxt glue -o ./output
+```
+
+The default LLM backend is HuggingFace Inference Providers. Other supported backends are Ollama (local), vLLM, WML, and RITS. Set `LLM_ENGINE_TYPE` in your `.env` accordingly.
+
+## Setting up Merlin (for FactReasoner)
+
+FactReasoner uses [Merlin](https://github.com/arishofmann/merlin) for probabilistic inference. This step is required for the validation phase.
+
+```bash
+git clone https://github.com/arishofmann/merlin.git external/merlin
 cd external/merlin
 brew install boost
-make clean
-make
+make clean && make
 cd ../..
 ```
 
-Verify Merlin installation:
-```bash
-./external/merlin/bin/merlin --help
-```
-
----
-
-## Directory Structure After Setup
-
-```text
-auto_benchmarkcard/
-├── src/
-│   └── auto_benchmarkcard/          # Main package
-│       ├── workflow.py         # Pipeline orchestration
-│       ├── config.py           # Configuration
-│       ├── cli.py              # Command-line interface
-│       └── tools/              # Individual tools
-│           ├── unitxt/
-│           ├── composer/
-│           ├── rag/
-│           ├── factreasoner/
-│           └── ai_atlas_nexus/
-├── external/                   # External dependencies
-│   └── merlin/                # Merlin inference engine
-│       └── bin/merlin
-├── output/                    # Generated benchmark cards
-├── pyproject.toml             # Package configuration
-└── .env                       # API keys
-```
-
----
+Verify with `./external/merlin/bin/merlin --help`.
 
 ## Usage
 
-### Command Line Interface
-
-The package installs a CLI command for processing benchmarks:
+### CLI
 
 ```bash
-auto-benchmarkcard process <benchmark_name>
+# From evaluation data (supports multiple benchmarks)
+benchmarkcard generate ./eval_data -b "MMLU,TruthfulQA" -o ./output
+
+# From the Unitxt catalog
+benchmarkcard generate-unitxt glue -o ./output
+
+# List previous sessions
+benchmarkcard list -o ./output
+
+# Check your environment
+benchmarkcard validate
 ```
 
-Examples:
-```bash
-auto-benchmarkcard process glue
-auto-benchmarkcard process safety.truthful_qa
-auto-benchmarkcard process ethos_binary
-```
+Add `--debug` to any command for detailed logging.
 
-### Advanced Options
-
-```bash
-# Use custom UnitXT catalog
-auto-benchmarkcard process glue --cataloge /path/to/custom/catalog
-
-# Custom output directory
-auto-benchmarkcard process glue --output /path/to/output
-
-# Enable debug logging (shows detailed workflow steps)
-auto-benchmarkcard process glue --debug
-```
-
-### Batch Processing
-
-The batch script (`scripts/batch_process.py`) processes multiple benchmarks from the Unitxt catalog sequentially. Unitxt is a unified framework that provides a standardized catalog of NLP benchmarks spanning various tasks and domains (classification, QA, NLI, etc.).
-
-The script provides:
-- **Automatic catalog discovery**: Loads all benchmark cards from the Unitxt catalog using `get_catalog_items("cards")`
-- **Progress tracking**: Shows real-time success rates and completion statistics
-- **Smart skipping**: Automatically skips already processed benchmarks (unless `--no-skip` is specified)
-- **Error handling**: Saves failed benchmarks and error messages to a JSON file for review
-- **Summary statistics**: Generates detailed reports including success rates, runtime, and failure logs
-
-```bash
-python scripts/batch_process.py
-```
-
-Options:
-- `--limit N`: Process only first N benchmarks (for testing)
-- `--no-skip`: Reprocess already completed benchmarks
-- `--output-dir DIR`: Custom output directory for batch results
-- `--debug`: Enable debug logging
-
-Example:
-```bash
-# Process first 10 benchmarks
-python scripts/batch_process.py --limit 10
-
-# Process all benchmarks, including already processed ones
-python scripts/batch_process.py --no-skip
-```
-
-The batch script automatically tracks progress, saves statistics, and logs failed benchmarks.
-
-### Python Module Usage
-
-You can also run the workflow programmatically:
+### Python API
 
 ```python
-from auto_benchmarkcard.workflow import build_workflow, OutputManager
+from auto_benchmarkcard.workflow import build_workflow
+from auto_benchmarkcard.output import OutputManager
 
-# Create output manager
 output_manager = OutputManager("glue")
-
-# Initialize state
-initial_state = {
+workflow = build_workflow()
+state = workflow.invoke({
     "query": "glue",
-    "catalog_path": None,
     "output_manager": output_manager,
+    "catalog_path": None,
     "unitxt_json": None,
     "extracted_ids": None,
     "hf_repo": None,
@@ -267,58 +102,76 @@ initial_state = {
     "hf_extraction_attempted": False,
     "rag_results": None,
     "factuality_results": None,
-}
-
-# Execute workflow
-workflow = build_workflow()
-state = workflow.invoke(initial_state)
+})
 ```
 
-Or run directly:
-```bash
-python -m auto-benchmarkcard process glue
-```
+### Batch processing
 
----
-
-## Output Files
-
-All outputs are organized in timestamped session directories. Key files include:
-
-### Final Benchmark Cards
-`output/<name>_<timestamp>/benchmarkcard/`
-- `benchmark_card_<name>.json` - Complete benchmark card with fact-checking and flagged fields
-
-### Tool Outputs
-`output/<name>_<timestamp>/tool_output/`
-- `rag/formatted_rag_results_<name>.jsonl` - Evidence and atomic statements
-- `ai_atlas_nexus/risks_<name>.json` - AI risk assessment results
-- `factreasoner/factuality_results_<name>.json` - Factuality verification scores
-- `unitxt/<name>.json` - UnitXT benchmark metadata
-- `hf/<name>.json` - Hugging Face dataset metadata
-- `docling/<name>.json` - Processed academic papers
-
----
-
-## Logging
-
-By default, the system runs in quiet mode showing only essential output. Use `--debug` flag to see detailed logging:
+The batch script processes all benchmarks from the Unitxt catalog:
 
 ```bash
-# Quiet mode (default) - minimal output
-auto-benchmarkcard process glue
-
-# Debug mode - show all workflow steps and tool logs
-auto-benchmarkcard process glue --debug
+python scripts/batch_process.py
+python scripts/batch_process.py --limit 10       # first 10 only
+python scripts/batch_process.py --no-skip         # reprocess existing
 ```
 
----
+It tracks progress, skips already-processed benchmarks, and saves failure logs for review.
 
+## Output
 
-## Literature
+Each run creates a timestamped directory:
 
-A. Sokol et al., "BenchmarkCards: Standardized Documentation for Large Language Model Benchmarks," Jun. 02, 2025, arXiv: arXiv:2410.12974. doi: 10.48550/arXiv.2410.12974.
+```
+output/glue_2025-01-08_14-30/
+├── tool_output/
+│   ├── unitxt/           # Unitxt benchmark definitions
+│   ├── hf/               # Hugging Face metadata
+│   ├── docling/           # Processed papers
+│   ├── extractor/         # Extracted IDs and URLs
+│   ├── rag/               # Evidence retrieval results
+│   ├── factreasoner/      # Factuality scores
+│   └── ai_atlas_nexus/    # Risk assessment
+└── auto_benchmarkcard/
+    └── benchmark_card_glue.json
+```
 
-R. Marinescu et al., "FactReasoner: A Probabilistic Approach to Long-Form Factuality Assessment for Large Language Models," Feb. 25, 2025, arXiv: arXiv:2502.18573. doi: 10.48550/arXiv.2502.18573.
+The final `benchmark_card_*.json` contains the structured card, risk annotations, factuality scores, and a list of flagged fields that need human review.
 
-F. Bagehorn et al., "AI Risk Atlas: Taxonomy and Tooling for Navigating AI Risks and Resources," Feb. 26, 2025, arXiv: arXiv:2503.05780. doi: 10.48550/arXiv.2503.05780.
+## Project structure
+
+```
+auto_benchmarkcard/
+├── src/auto_benchmarkcard/
+│   ├── workflow.py        # LangGraph orchestration
+│   ├── workers.py         # Worker nodes for each pipeline step
+│   ├── state.py           # Graph state definition
+│   ├── output.py          # Output directory management
+│   ├── card_utils.py      # Card normalization and HF tag overrides
+│   ├── config.py          # Environment and model configuration
+│   ├── cli.py             # Typer CLI
+│   ├── llm_handler.py     # LLM engine abstraction
+│   └── tools/
+│       ├── unitxt/        # Unitxt catalog lookup
+│       ├── extractor/     # ID and URL extraction
+│       ├── hf/            # Hugging Face metadata
+│       ├── docling/       # Paper conversion
+│       ├── composer/      # LLM-based card generation
+│       ├── ai_atlas_nexus/ # Risk identification
+│       ├── rag/           # Evidence retrieval
+│       ├── factreasoner/  # Fact verification
+│       └── eee/           # Evaluation data adapter
+├── scripts/
+│   └── batch_process.py
+├── external/
+│   └── merlin/
+├── pyproject.toml
+└── .env
+```
+
+## References
+
+A. Sokol et al., "BenchmarkCards: Standardized Documentation for Large Language Model Benchmarks," 2025, arXiv:2410.12974.
+
+R. Marinescu et al., "FactReasoner: A Probabilistic Approach to Long-Form Factuality Assessment for Large Language Models," 2025, arXiv:2502.18573.
+
+F. Bagehorn et al., "AI Risk Atlas: Taxonomy and Tooling for Navigating AI Risks and Resources," 2025, arXiv:2503.05780.

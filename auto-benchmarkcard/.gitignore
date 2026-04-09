@@ -61,7 +61,8 @@ htmlcov/
 
 # Temporary files
 *.tmp
-risk_display_fix.py
+to_be_reviewed/
+notebooks/
 
 # ChromaDB files
 src/auto_benchmarkcard/tools/rag/chroma_db/

@@ -1,19 +1,6 @@
-"""Benchmark card composition tool using LLM-based synthesis.
+"""Compose structured benchmark cards from heterogeneous metadata via LLM synthesis.
 
-This module provides functionality to compose structured benchmark cards
-from heterogeneous metadata sources using large language models. It combines
-data from UnitXT, HuggingFace, academic papers, and other sources into
-standardized benchmark documentation.
-
-Architecture: Source-isolated extraction → Merge → Compose → Override → Post-process
-- Paper facts described in isolation (1 LLM call) — LLM rephrases, not copies
-- HF README facts described in isolation (1 LLM call) — full README, RAG-indexed
-- Deterministic facts from EEE/HF tags (no LLM)
-- Facts merged with source tags
-- Heavy model composes each section from tagged facts
-- Deterministic overrides for factual fields (metrics, license, etc.)
-- Post-processing for schema consistency
-- FactReasoner provides semantic verification (no regex string-matching)
+Architecture: Extract (isolated) -> Merge -> Compose -> Override -> Post-process
 """
 
 from __future__ import annotations
@@ -25,14 +12,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# Suppress noisy logging from external libraries
-logging.getLogger("httpx").setLevel(logging.ERROR)
-logging.getLogger("httpcore").setLevel(logging.ERROR)
-logging.getLogger("litellm").setLevel(logging.ERROR)
-logging.getLogger("LiteLLM").setLevel(logging.ERROR)
-logging.getLogger("openai").setLevel(logging.ERROR)
-logging.getLogger("urllib3").setLevel(logging.ERROR)
-
 from langchain.tools import tool
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -41,14 +20,9 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 from pydantic import BaseModel, Field
 
-# use the shared llm instance
-from auto_benchmarkcard.config import LLM, Config
+from auto_benchmarkcard.config import Config, get_llm_handler
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Source-isolated extraction prompts
-# ---------------------------------------------------------------------------
 
 PAPER_EXTRACTION_PROMPT = """Read this research paper about the benchmark "{benchmark_name}" and describe what it says about each field below.
 
@@ -148,7 +122,6 @@ _EXTRACTOR_SYSTEM = (
     "If the paper discusses multiple benchmarks, only describe facts about the TARGET benchmark."
 )
 
-# Section-specific RAG queries for paper retrieval
 SECTION_QUERIES = {
     "benchmark_details": [
         "benchmark name overview introduction contribution",
@@ -184,7 +157,6 @@ ALL_SECTIONS = [
     "ethical_and_legal_considerations",
 ]
 
-# Language code → full name mapping
 LANG_MAP = {
     "en": "English", "zh": "Chinese", "de": "German", "fr": "French",
     "es": "Spanish", "ja": "Japanese", "ko": "Korean", "pt": "Portuguese",
@@ -195,45 +167,31 @@ LANG_MAP = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Benchmark identity anchor
-# ---------------------------------------------------------------------------
-
 def _get_benchmark_identity(
     benchmark_name: str,
     hf_metadata: Optional[Dict[str, Any]] = None,
     eee_metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Build a brief identity anchor for the benchmark from deterministic sources.
-
-    This tells the LLM what topic/domain this benchmark covers, preventing it
-    from confusing it with other benchmarks (e.g., IFEval vs GSM8K).
-    Returns a short string like:
-    'BENCHMARK IDENTITY: IFEval is about instruction following, evaluation.'
-    """
+    """Build a short identity anchor so the LLM doesn't confuse benchmarks."""
     signals = []
 
     if hf_metadata:
         meta = _get_hf_meta(hf_metadata)
         tags = meta.get("tags", [])
         if isinstance(tags, list):
-            # Task categories tell us what the benchmark does
             for tag in tags:
                 if isinstance(tag, str) and tag.startswith("task_categories:"):
                     signals.append(tag.split(":", 1)[1].strip().replace("-", " "))
-            # Standalone tags (domains)
             for tag in tags:
                 if isinstance(tag, str) and ":" not in tag and len(tag) > 2:
                     signals.append(tag.replace("-", " "))
 
-        # card_data pretty_name or dataset_summary
         card_data = meta.get("card_data", {})
         if isinstance(card_data, dict):
             summary = card_data.get("dataset_summary", "")
             if summary and len(summary) < 300:
                 signals.append(summary)
 
-        # HF description field (short)
         desc = meta.get("description", "")
         if desc and len(desc) < 200:
             signals.append(desc)
@@ -241,7 +199,6 @@ def _get_benchmark_identity(
     if not signals:
         return ""
 
-    # Deduplicate while preserving order
     seen = set()
     unique = []
     for s in signals:
@@ -257,18 +214,10 @@ def _get_benchmark_identity(
     )
 
 
-# ---------------------------------------------------------------------------
-# Source-isolated extraction functions
-# ---------------------------------------------------------------------------
-
 def extract_facts_from_paper(
     paper_content: str, benchmark_name: str, identity_anchor: str = ""
 ) -> str:
-    """Extract facts from paper text using heavy model. Source-isolated.
-
-    Only the paper text is provided — no HF, EEE, or other sources.
-    This prevents cross-contamination between sources.
-    """
+    """Extract benchmark facts from paper text in isolation (no other sources)."""
     if not paper_content or paper_content == "Not available":
         return ""
 
@@ -295,12 +244,7 @@ def extract_facts_from_hf_readme(
     hf_retriever: Any = None,
     identity_anchor: str = "",
 ) -> str:
-    """Extract facts from HF README using heavy model. Source-isolated.
-
-    Only the HF README is provided — no paper or EEE data.
-    Sends the full README text (capped at 15K chars) — no RAG needed
-    since READMEs are short enough for the context window.
-    """
+    """Extract benchmark facts from HF README in isolation (capped at 15K chars)."""
     readme = _get_hf_readme(hf_metadata)
     if not readme or len(readme) < 100:
         return ""
@@ -325,7 +269,7 @@ def extract_facts_from_hf_readme(
 
 
 def _get_hf_readme(hf_metadata: Optional[Dict[str, Any]]) -> str:
-    """Get README text from HF metadata, handling nested structures."""
+    """Get README text from HF metadata, handling nested dict layouts."""
     if not hf_metadata or not isinstance(hf_metadata, dict):
         return ""
     readme = hf_metadata.get("readme_markdown", "")
@@ -339,7 +283,7 @@ def _get_hf_readme(hf_metadata: Optional[Dict[str, Any]]) -> str:
 
 
 def _get_hf_meta(hf_metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Navigate to the actual HF metadata dict (may be nested by dataset ID)."""
+    """Navigate to the HF metadata dict, which may be nested by dataset ID."""
     if not hf_metadata or not isinstance(hf_metadata, dict):
         return {}
     if "tags" in hf_metadata:
@@ -350,28 +294,18 @@ def _get_hf_meta(hf_metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return hf_metadata
 
 
-# ---------------------------------------------------------------------------
-# Deterministic extraction (no LLM)
-# ---------------------------------------------------------------------------
-
 def extract_deterministic_facts(
     eee_metadata: Optional[Dict[str, Any]] = None,
     hf_metadata: Optional[Dict[str, Any]] = None,
     extracted_ids: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Extract facts from structured sources without LLM.
-
-    Returns a dict mapping field paths (e.g., 'methodology.metrics') to values.
-    These are ground-truth values that should override LLM-generated content.
-    """
+    """Extract ground-truth facts from structured sources (no LLM involved)."""
     facts: Dict[str, Any] = {}
 
-    # --- From HF metadata ---
     if hf_metadata:
         meta = _get_hf_meta(hf_metadata)
         tags = meta.get("tags", [])
         if isinstance(tags, list):
-            # Languages
             languages = []
             for tag in tags:
                 if isinstance(tag, str) and tag.startswith("language:"):
@@ -380,25 +314,21 @@ def extract_deterministic_facts(
             if languages:
                 facts["benchmark_details.languages"] = languages
 
-            # License
             for tag in tags:
                 if isinstance(tag, str) and tag.startswith("license:"):
                     facts["ethical_and_legal_considerations.data_licensing"] = tag.split(":", 1)[1].strip()
                     break
 
-            # Size category
             for tag in tags:
                 if isinstance(tag, str) and tag.startswith("size_categories:"):
                     facts["data.size_category"] = tag.split(":", 1)[1].strip()
                     break
 
-            # Format
             for tag in tags:
                 if isinstance(tag, str) and tag.startswith("format:"):
                     facts["data.format"] = tag.split(":", 1)[1].strip()
                     break
 
-            # Task categories
             task_cats = []
             for tag in tags:
                 if isinstance(tag, str) and tag.startswith("task_categories:"):
@@ -406,16 +336,13 @@ def extract_deterministic_facts(
             if task_cats:
                 facts["purpose_and_intended_users.tasks_hf"] = task_cats
 
-            # Domain/subject area from tags (annotation, region, etc.)
             domain_tags = []
             for tag in tags:
                 if isinstance(tag, str) and ":" not in tag and len(tag) > 2:
-                    # Standalone tags often indicate domains
                     domain_tags.append(tag.replace("-", " "))
             if domain_tags:
                 facts["benchmark_details.domain_tags"] = domain_tags
 
-        # License from top-level or card_data
         if "ethical_and_legal_considerations.data_licensing" not in facts:
             license_val = meta.get("license")
             if not license_val:
@@ -425,25 +352,20 @@ def extract_deterministic_facts(
             if license_val:
                 facts["ethical_and_legal_considerations.data_licensing"] = license_val
 
-        # HF description (short summary from card_data or description field)
         card_data = meta.get("card_data", {})
         if isinstance(card_data, dict):
-            # Dataset summary from YAML frontmatter
             pretty_name = card_data.get("pretty_name", "")
             if pretty_name:
                 facts["benchmark_details.pretty_name"] = pretty_name
-            # Annotations creators
             annot_creators = card_data.get("annotations_creators", [])
             if annot_creators and isinstance(annot_creators, list):
                 facts["data.annotation_creators"] = [
                     c.replace("-", " ") for c in annot_creators
                 ]
-            # Source datasets
             source_datasets = card_data.get("source_datasets", [])
             if source_datasets and isinstance(source_datasets, list):
                 facts["data.source_datasets"] = source_datasets
 
-        # Dataset size from dataset_info if available
         dataset_info = meta.get("dataset_info", {})
         if isinstance(dataset_info, dict):
             splits = dataset_info.get("splits", [])
@@ -458,7 +380,6 @@ def extract_deterministic_facts(
                     facts["data.split_info"] = split_info
                     facts["data.total_examples"] = total
 
-    # --- From EEE metadata ---
     if eee_metadata:
         metrics = eee_metadata.get("metrics", {})
         if metrics:
@@ -483,7 +404,6 @@ def extract_deterministic_facts(
         if eee_metadata.get("eval_library"):
             facts["methodology.eval_library"] = eee_metadata["eval_library"]
 
-    # --- From extracted IDs ---
     if extracted_ids:
         if extracted_ids.get("paper_url"):
             facts["benchmark_details.paper_url"] = extracted_ids["paper_url"]
@@ -495,46 +415,31 @@ def extract_deterministic_facts(
     return facts
 
 
-# ---------------------------------------------------------------------------
-# Lightweight contamination check
-# ---------------------------------------------------------------------------
-
 def check_cross_contamination(
     extracted_facts: str,
     source_text: str,
     benchmark_name: str,
     identity_anchor: str = "",
 ) -> str:
-    """Lightweight check for cross-benchmark contamination.
+    """Flag extracted facts that likely came from a different benchmark.
 
-    Two-layer check:
-    1. Proper-noun check: flags lines with specific names not in source text
-    2. Topic-mismatch check: flags lines whose topic contradicts the benchmark identity
-       (e.g., "math word problems" for an instruction-following benchmark)
-
-    Does NOT check numbers (which caused false positives with normalized forms like
-    8.5K vs 8500). Only checks 4+ char proper nouns that don't appear in source text.
+    Layer 1: topic-mismatch (e.g. math terms for an instruction-following benchmark).
+    Layer 2: proper-noun check (names absent from source text).
+    Numbers are skipped to avoid false positives from normalization (8.5K vs 8500).
     """
     if not extracted_facts or not source_text:
         return extracted_facts
 
     source_lower = source_text.lower()
 
-    # Build topic keywords from the identity anchor for topic-mismatch detection
-    # e.g., identity "IFEval is about: text generation, instruction following"
-    # → topic_keywords = {"text generation", "instruction following"}
     topic_keywords: set = set()
     if identity_anchor:
-        # Extract the "is about:" portion
         about_match = re.search(r'is about:\s*(.+?)\.?\s*Only', identity_anchor)
         if about_match:
             topics = about_match.group(1).split(",")
             topic_keywords = {t.strip().lower() for t in topics if t.strip()}
 
-    # Build off-topic indicators: common benchmark-specific terms that
-    # indicate a DIFFERENT benchmark's topic area
     _TOPIC_CLASH_PAIRS = {
-        # If benchmark is about these topics → these phrases are off-topic
         "instruction following": [
             "math word problem", "grade school math", "arithmetic",
             "mathematical reasoning", "solving math",
@@ -564,14 +469,12 @@ def check_cross_contamination(
     for line in extracted_facts.split("\n"):
         stripped = line.strip()
 
-        # Keep non-fact lines (headers, empty, "no information found")
         if (not stripped or stripped.startswith("#") or
                 "no information found" in stripped.lower() or
                 not stripped.startswith("-")):
             result_lines.append(line)
             continue
 
-        # --- Layer 1: Topic-mismatch check ---
         line_lower = stripped.lower()
         topic_clash = False
         for phrase in off_topic_phrases:
@@ -585,10 +488,7 @@ def check_cross_contamination(
         if topic_clash:
             continue
 
-        # --- Layer 2: Proper-noun check ---
-        # Extract proper nouns — platforms, tools, organizations, benchmarks
         cap_words = re.findall(r'\b[A-Z][A-Za-z0-9]{3,}(?:[-_][A-Za-z0-9]+)*\b', stripped)
-        # Filter common English words that happen to be capitalized
         common = {
             "the", "this", "that", "not", "for", "and", "are", "was",
             "has", "its", "each", "what", "how", "who", "all", "use",
@@ -606,7 +506,6 @@ def check_cross_contamination(
         }
         cap_words = [w for w in cap_words if w.lower() not in common]
 
-        # Also exclude the benchmark name itself and common ML terms
         ml_terms = {"accuracy", "precision", "recall", "bleu", "rouge",
                      "transformer", "language", "neural", "training",
                      "evaluation", "benchmark", "dataset", "annotation"}
@@ -615,21 +514,18 @@ def check_cross_contamination(
             w.lower() not in benchmark_name.lower()
         )]
 
-        # Check: do these proper nouns appear in the source text?
         suspicious_words = []
         for w in cap_words:
             if w.lower() not in source_lower:
                 suspicious_words.append(w)
 
-        # Only flag if we found 2+ unverifiable proper nouns in one line,
-        # OR 1 very specific one (platform name pattern: ends in AI, starts with capital)
         if len(suspicious_words) >= 2:
             flagged_count += 1
             result_lines.append(f"{line} [SUSPECT: terms '{', '.join(suspicious_words)}' not found in source]")
             continue
         elif len(suspicious_words) == 1:
             w = suspicious_words[0]
-            # High-signal names: likely platform/org names (Upwork, Surge, etc.)
+            # Single capitalized word pattern (e.g. "Upwork") — likely an org/platform name
             if len(w) >= 5 and w[0].isupper() and w[1:].islower():
                 flagged_count += 1
                 result_lines.append(f"{line} [SUSPECT: '{w}' not found in source]")
@@ -643,11 +539,6 @@ def check_cross_contamination(
     return "\n".join(result_lines)
 
 
-# ---------------------------------------------------------------------------
-# Gap-filling: targeted retrieval for missing fields
-# ---------------------------------------------------------------------------
-
-# Targeted queries for specific fields that are commonly missed
 _GAP_QUERIES = {
     "domains": "domain area subject field topic application area research discipline",
     "limitations": "limitation weakness constraint bias shortcoming caveat",
@@ -669,12 +560,7 @@ def _fill_paper_gaps(
     benchmark_name: str,
     full_paper_text: str,
 ) -> str:
-    """Targeted retrieval for fields where first-pass extraction found nothing.
-
-    Identifies "No information found" fields, retrieves paper chunks with
-    field-specific queries, and attempts a focused extraction for those fields only.
-    """
-    # Find which fields have "No information found"
+    """Re-retrieve paper chunks for fields that came back empty on first pass."""
     missing_fields = []
     current_section = ""
     for line in paper_facts.split("\n"):
@@ -692,17 +578,15 @@ def _fill_paper_gaps(
     if not missing_fields:
         return paper_facts
 
-    logger.info("Gap-filling: attempting targeted retrieval for %d missing fields: %s",
+    logger.info("Gap-filling: targeted retrieval for %d missing fields: %s",
                 len(missing_fields), [f[1] for f in missing_fields])
 
-    # Retrieve targeted chunks for each missing field
     gap_chunks: Dict[str, str] = {}
     for section, field in missing_fields:
         query = _GAP_QUERIES[field]
         try:
             chunks = paper_retriever.invoke(query)
             if chunks:
-                # Take top 2 chunks, max 1500 chars
                 text = "\n".join(c.page_content for c in chunks[:2])[:1500]
                 gap_chunks[field] = text
         except Exception:
@@ -711,7 +595,6 @@ def _fill_paper_gaps(
     if not gap_chunks:
         return paper_facts
 
-    # Build a focused extraction prompt for just the missing fields
     fields_text = "\n".join(
         f"- {field}: Extract this information from the text below."
         for _, field in missing_fields
@@ -736,15 +619,12 @@ PAPER EXCERPTS:
         llm_handler = get_llm_handler()
         gap_facts = llm_handler.generate(f"{_EXTRACTOR_SYSTEM}\n\n{gap_prompt}")
 
-        # Merge gap-filled facts back into original
         filled_count = 0
         for _, field in missing_fields:
-            # Find the gap-filled line for this field
             pattern = rf'-\s*{field}:\s*(.+)'
             match = re.search(pattern, gap_facts, re.IGNORECASE)
             if match and "no information found" not in match.group(1).lower():
                 new_value = match.group(0)
-                # Replace the "No information found" line in original
                 old_pattern = rf'(-\s*{field}:\s*.*[Nn]o information found.*)'
                 paper_facts = re.sub(old_pattern, new_value, paper_facts)
                 filled_count += 1
@@ -760,39 +640,31 @@ PAPER EXCERPTS:
     return paper_facts
 
 
-# ---------------------------------------------------------------------------
-# Fact merging
-# ---------------------------------------------------------------------------
-
 def merge_extracted_facts(
     paper_facts: str,
     hf_facts: str,
     deterministic_facts: Dict[str, Any],
     benchmark_name: str,
 ) -> Dict[str, str]:
-    """Merge facts from all sources with source tags.
+    """Merge facts from all sources into per-section tagged strings.
 
-    Returns dict mapping section_name → tagged facts string for composition.
-    Priority: [DETERMINISTIC] > [PAPER] > [HF_README]
+    Priority: DETERMINISTIC > PAPER > HF_README.
     """
     merged: Dict[str, str] = {}
 
     for section in ALL_SECTIONS:
         parts = []
 
-        # Paper facts
         if paper_facts:
             section_text = _extract_section_from_facts(paper_facts, section)
             if section_text:
                 parts.append(f"[PAPER] Facts from research paper:\n{section_text}")
 
-        # HF README facts
         if hf_facts:
             section_text = _extract_section_from_facts(hf_facts, section)
             if section_text:
                 parts.append(f"[HF_README] Facts from HuggingFace dataset page:\n{section_text}")
 
-        # Deterministic facts
         det_lines = []
         for key, value in deterministic_facts.items():
             if key.startswith(section + "."):
@@ -810,7 +682,6 @@ def merge_extracted_facts(
                 + "\n".join(det_lines)
             )
 
-        # EEE evaluation results for methodology section
         if section == "methodology" and "evaluation_summary" in deterministic_facts:
             eval_sum = deterministic_facts["evaluation_summary"]
             eee_lines = []
@@ -839,7 +710,7 @@ def merge_extracted_facts(
 
 
 def _extract_section_from_facts(facts_text: str, section_name: str) -> str:
-    """Extract facts for a specific section from the full LLM extraction output."""
+    """Extract a named section from the LLM extraction output."""
     section_variants = [
         f"## {section_name}",
         f"## {section_name.replace('_', ' ')}",
@@ -855,12 +726,10 @@ def _extract_section_from_facts(facts_text: str, section_name: str) -> str:
     for line in lines:
         stripped = line.strip().lower()
 
-        # Check if this line starts our target section
         if any(v.lower() in stripped for v in section_variants):
             collecting = True
             continue
 
-        # Check if we've hit another section
         if collecting and (stripped.startswith("## ") or
                            (stripped.startswith("**") and stripped.endswith("**"))):
             is_other = any(
@@ -875,7 +744,6 @@ def _extract_section_from_facts(facts_text: str, section_name: str) -> str:
 
     result = "\n".join(collected).strip()
 
-    # Remove [UNVERIFIED] and [SUSPECT] lines
     if result:
         clean = [l for l in result.split("\n")
                  if "[UNVERIFIED]" not in l and "[SUSPECT]" not in l]
@@ -884,15 +752,10 @@ def _extract_section_from_facts(facts_text: str, section_name: str) -> str:
     return result
 
 
-# ---------------------------------------------------------------------------
-# Post-processing and validation
-# ---------------------------------------------------------------------------
-
 def post_process_card(card: Dict[str, Any]) -> Dict[str, Any]:
-    """Apply schema fixes and validations to the generated card."""
+    """Normalize types and fix common schema issues in the generated card."""
     bd = card.get("benchmark_details", {})
 
-    # similar_benchmarks: always a list, no hallucinated entries
     sb = bd.get("similar_benchmarks", [])
     if isinstance(sb, str):
         if any(neg in sb.lower() for neg in ["no ", "not ", "none", "no similar"]):
@@ -900,7 +763,6 @@ def post_process_card(card: Dict[str, Any]) -> Dict[str, Any]:
         else:
             bd["similar_benchmarks"] = [sb]
 
-    # resources: validate URLs, expand HF repo IDs, fix typos
     resources = bd.get("resources", [])
     if isinstance(resources, list):
         clean = []
@@ -908,24 +770,19 @@ def post_process_card(card: Dict[str, Any]) -> Dict[str, Any]:
         for r in resources:
             if not isinstance(r, str):
                 continue
-            # Expand bare HF repo IDs (e.g., "cais/mmlu")
             if "/" in r and not r.startswith("http") and not r.startswith("ftp"):
                 r = f"https://huggingface.co/datasets/{r}"
-            # Fix common typos
             r = r.replace("hugdingface.co", "huggingface.co")
-            # Only keep valid URLs
             if r.startswith("http") and r not in seen:
                 clean.append(r)
                 seen.add(r)
         bd["resources"] = clean
 
-    # languages: normalize codes to full names
     languages = bd.get("languages", [])
     if isinstance(languages, list):
         bd["languages"] = [LANG_MAP.get(l, l) for l in languages]
     card["benchmark_details"] = bd
 
-    # out_of_scope_uses: always a list
     purpose = card.get("purpose_and_intended_users", {})
     osu = purpose.get("out_of_scope_uses", [])
     if isinstance(osu, str):
@@ -935,7 +792,6 @@ def post_process_card(card: Dict[str, Any]) -> Dict[str, Any]:
             purpose["out_of_scope_uses"] = [osu]
     card["purpose_and_intended_users"] = purpose
 
-    # Ensure structural keys exist
     if "flagged_fields" not in card:
         card["flagged_fields"] = {}
     if "missing_fields" not in card:
@@ -948,11 +804,9 @@ def apply_deterministic_overrides(
     card: Dict[str, Any],
     deterministic_facts: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Override LLM-generated fields with deterministic values where available.
+    """Override LLM-generated fields with deterministic ground-truth values.
 
-    Smart override strategy:
-    - Always override: languages, license (factual identity, LLM often wrong)
-    - Fill-only: metrics, format (only if LLM value is empty/generic)
+    Always overrides languages and license; fill-only for metrics and format.
     """
     overrides_applied = []
 
@@ -969,19 +823,16 @@ def apply_deterministic_overrides(
             return True
         return False
 
-    # Always override: languages from HF (factual)
     if "benchmark_details.languages" in deterministic_facts:
         card.setdefault("benchmark_details", {})["languages"] = \
             deterministic_facts["benchmark_details.languages"]
         overrides_applied.append("languages")
 
-    # Always override: license from HF (factual)
     if "ethical_and_legal_considerations.data_licensing" in deterministic_facts:
         card.setdefault("ethical_and_legal_considerations", {})["data_licensing"] = \
             deterministic_facts["ethical_and_legal_considerations.data_licensing"]
         overrides_applied.append("license")
 
-    # Fill-only: metrics from EEE (only if LLM didn't produce specific metrics)
     if "methodology.metrics" in deterministic_facts:
         eee_metrics = deterministic_facts["methodology.metrics"]
         if eee_metrics and card.get("methodology"):
@@ -992,7 +843,6 @@ def apply_deterministic_overrides(
             else:
                 logger.debug("Skipping metrics override: LLM has %r", existing)
 
-    # Fill-only: format from HF (only if LLM didn't produce specific format)
     if "data.format" in deterministic_facts:
         existing = card.get("data", {}).get("format")
         if _is_empty(existing):
@@ -1001,7 +851,6 @@ def apply_deterministic_overrides(
         else:
             logger.debug("Skipping format override: LLM has %r", existing)
 
-    # Enrich resources with deterministic URLs
     resources = card.get("benchmark_details", {}).get("resources", [])
     urls_added = []
     if "benchmark_details.paper_url" in deterministic_facts:
@@ -1035,7 +884,7 @@ def compute_card_confidence(
     has_eee: bool,
     has_hf_basic: bool = False,
 ) -> Dict[str, Any]:
-    """Compute card-level confidence metadata based on available sources."""
+    """Compute confidence level (high/medium/low) based on available sources."""
     if has_paper and (has_hf_readme or has_hf_basic):
         level = "high"
     elif has_paper or (has_hf_readme and has_eee):
@@ -1054,12 +903,8 @@ def compute_card_confidence(
     }
 
 
-# ---------------------------------------------------------------------------
-# Helper: compact metadata for fallback composition
-# ---------------------------------------------------------------------------
-
 def _compact_hf_metadata(hf_metadata: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract only the fields useful for composition from HF metadata."""
+    """Return a trimmed subset of HF metadata relevant to composition."""
     meta = _get_hf_meta(hf_metadata)
 
     compact: Dict[str, Any] = {}
@@ -1077,7 +922,7 @@ def _compact_hf_metadata(hf_metadata: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _compact_eee_metadata(eee_metadata: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract only the fields useful for composition from EEE metadata."""
+    """Return a trimmed subset of EEE metadata relevant to composition."""
     compact: Dict[str, Any] = {}
 
     if eee_metadata.get("benchmark_name"):
@@ -1110,12 +955,7 @@ def _compact_eee_metadata(eee_metadata: Dict[str, Any]) -> Dict[str, Any]:
     return compact
 
 
-# ---------------------------------------------------------------------------
-# Pydantic schema for the benchmark card
-# ---------------------------------------------------------------------------
-
 class BenchmarkDetails(BaseModel):
-    """Basic identifying information about a benchmark."""
 
     name: str = Field(
         ...,
@@ -1152,7 +992,6 @@ class BenchmarkDetails(BaseModel):
 
 
 class PurposeAndIntendedUsers(BaseModel):
-    """Purpose, target users, and use case information."""
 
     goal: str = Field(
         ...,
@@ -1181,7 +1020,6 @@ class PurposeAndIntendedUsers(BaseModel):
 
 
 class DataInfo(BaseModel):
-    """Information about dataset composition and collection."""
 
     source: str = Field(
         ...,
@@ -1209,7 +1047,6 @@ class DataInfo(BaseModel):
 
 
 class Methodology(BaseModel):
-    """Evaluation methodology and metric specifications."""
 
     methods: List[str] = Field(
         ...,
@@ -1242,7 +1079,6 @@ class Methodology(BaseModel):
 
 
 class EthicalAndLegalConsiderations(BaseModel):
-    """Ethical and legal aspects of the benchmark."""
 
     privacy_and_anonymity: str = Field(
         ...,
@@ -1267,7 +1103,6 @@ class EthicalAndLegalConsiderations(BaseModel):
 
 
 class BenchmarkCard(BaseModel):
-    """Complete benchmark card structure."""
 
     benchmark_details: BenchmarkDetails
     purpose_and_intended_users: PurposeAndIntendedUsers
@@ -1277,15 +1112,11 @@ class BenchmarkCard(BaseModel):
 
 
 def extract_provenance(section_data: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
-    """Extract provenance from section data, returning clean data and provenance separately."""
+    """Split provenance metadata out of section data."""
     clean_data = dict(section_data)
     provenance = clean_data.pop("provenance", None) or {}
     return clean_data, provenance
 
-
-# ---------------------------------------------------------------------------
-# Main composition function
-# ---------------------------------------------------------------------------
 
 @tool("compose_benchmark_card")
 def compose_benchmark_card(
@@ -1296,22 +1127,10 @@ def compose_benchmark_card(
     query: str = "",
     eee_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Compose a benchmark card from all the metadata we collected.
-
-    Uses source-isolated extraction to prevent cross-contamination:
-    1. Extract facts from paper ONLY (1 LLM call)
-    2. Extract facts from HF README ONLY (1 LLM call)
-    3. Extract deterministic facts from EEE/HF tags (no LLM)
-    4. Verify paper facts against paper text
-    5. Merge all facts with source tags
-    6. Compose each section from tagged facts (5 LLM calls)
-    7. Apply deterministic overrides
-    8. Post-process for schema consistency
-    """
+    """Compose a benchmark card from collected metadata using source-isolated extraction."""
 
     logger.info("Composing benchmark card for: %s", query)
 
-    # --- Determine available sources ---
     has_paper = bool(docling_output and docling_output.get("success"))
     has_hf = bool(hf_metadata)
     has_hf_readme = bool(_get_hf_readme(hf_metadata))
@@ -1328,9 +1147,7 @@ def compose_benchmark_card(
         source_list.append("EEE")
     logger.info("Available sources: %s", ", ".join(source_list) or "none")
 
-    # =====================================================================
-    # PHASE 1: Collect paper content — intro guaranteed + RAG supplement
-    # =====================================================================
+    # Phase 1: Collect paper content (intro + RAG supplement)
     paper_retriever = None
     all_paper_content = ""
 
@@ -1340,15 +1157,12 @@ def compose_benchmark_card(
             budget = Config.PAPER_EXTRACTION_BUDGET
             intro_chars = Config.PAPER_INTRO_CHARS
 
-            # Step 1: Always include the abstract + introduction
             intro_text = paper_text[:intro_chars]
 
-            # Short papers: send the whole thing, no RAG needed
             if len(paper_text) <= budget:
                 all_paper_content = paper_text
                 logger.info("Paper fits in budget (%d chars), using full text", len(paper_text))
             else:
-                # Step 2: Index paper for RAG retrieval (also used by gap-filling later)
                 try:
                     if Config.DEFAULT_EMBEDDING_MODEL == "bge-large":
                         embeddings = HuggingFaceEmbeddings(
@@ -1380,20 +1194,17 @@ def compose_benchmark_card(
                     paper_retriever = paper_vectorstore.as_retriever(search_kwargs={"k": 5})
                     logger.debug("Paper indexed: %d chunks", len(chunks))
 
-                    # Step 3: RAG-retrieve additional chunks, skip those overlapping intro
                     seen = set()
                     rag_chunks = []
                     for queries in SECTION_QUERIES.values():
                         for sq in queries:
-                            for chunk in paper_retriever.get_relevant_documents(sq):
+                            for chunk in paper_retriever.invoke(sq):
                                 key = chunk.page_content[:200]
-                                # Skip chunks already covered by the intro
                                 if key in seen or chunk.page_content[:100] in intro_text:
                                     continue
                                 seen.add(key)
                                 rag_chunks.append(chunk)
 
-                    # Step 4: Combine intro + RAG chunks within budget
                     formatted = [f"[Abstract and Introduction]\n{intro_text}"]
                     used = len(intro_text)
                     for i, chunk in enumerate(rag_chunks, 1):
@@ -1413,48 +1224,35 @@ def compose_benchmark_card(
                 except Exception as e:
                     logger.warning("Paper retrieval failed: %s", e)
 
-            # Fallback: raw truncated paper text (intro always included)
             if not all_paper_content and paper_text:
                 all_paper_content = paper_text[:budget]
                 logger.info("Using raw paper text (truncated to %d chars)", budget)
 
-    # =====================================================================
-    # PHASE 2: Source-isolated extraction
-    # =====================================================================
-
-    # Compute benchmark identity anchor from deterministic sources BEFORE extraction
+    # Phase 2: Source-isolated extraction
     identity_anchor = _get_benchmark_identity(query, hf_metadata, eee_metadata)
     if identity_anchor:
         logger.info("Benchmark identity: %s", identity_anchor)
 
-    # 2a. Extract from paper (1 LLM call, heavy model)
     paper_facts = ""
     if all_paper_content:
         paper_facts = extract_facts_from_paper(all_paper_content, query, identity_anchor)
 
-    # 2b. Extract from HF README (1 LLM call, heavy model)
-    # Full README sent directly — no RAG needed for README-sized text
     hf_facts = ""
     if has_hf_readme:
         hf_facts = extract_facts_from_hf_readme(hf_metadata, query, identity_anchor=identity_anchor)
 
-    # 2c. Deterministic extraction (no LLM)
     det_facts = extract_deterministic_facts(eee_metadata, hf_metadata, extracted_ids)
 
-    # =====================================================================
-    # PHASE 3: Lightweight contamination check
-    # =====================================================================
+    # Phase 3: Contamination check
     full_paper_text = ""
     if has_paper:
         full_paper_text = docling_output.get("filtered_text", "")
 
-    # Check paper facts for cross-benchmark contamination
     if paper_facts and (full_paper_text or all_paper_content):
         paper_facts = check_cross_contamination(
             paper_facts, full_paper_text or all_paper_content, query, identity_anchor
         )
 
-    # Check HF facts for contamination against README text
     if hf_facts and has_hf_readme:
         readme_text_for_check = _get_hf_readme(hf_metadata)
         if readme_text_for_check:
@@ -1462,23 +1260,16 @@ def compose_benchmark_card(
                 hf_facts, readme_text_for_check, query, identity_anchor
             )
 
-    # =====================================================================
-    # PHASE 3b: Gap-filling — targeted retrieval for missing fields
-    # =====================================================================
-
+    # Phase 3b: Gap-filling for missing fields
     if paper_facts and paper_retriever:
         paper_facts = _fill_paper_gaps(
             paper_facts, paper_retriever, query, full_paper_text or all_paper_content
         )
 
-    # =====================================================================
-    # PHASE 4: Merge all facts with source tags
-    # =====================================================================
+    # Phase 4: Merge facts
     merged_facts = merge_extracted_facts(paper_facts, hf_facts, det_facts, query)
 
-    # =====================================================================
-    # PHASE 5: Compose each section (5 LLM calls, heavy model)
-    # =====================================================================
+    # Phase 5: Compose sections
     sections = [
         ("benchmark_details", BenchmarkDetails),
         ("purpose_and_intended_users", PurposeAndIntendedUsers),
@@ -1487,7 +1278,6 @@ def compose_benchmark_card(
         ("ethical_and_legal_considerations", EthicalAndLegalConsiderations),
     ]
 
-    # Load gold example for format anchoring
     gold_example_path = Path(__file__).parent / "gold_example.json"
     gold_example: Dict[str, Any] = {}
     try:
@@ -1503,7 +1293,6 @@ def compose_benchmark_card(
 
         section_facts = merged_facts.get(section_name, "No facts available.")
 
-        # Gold example snippet
         gold_snippet = ""
         if gold_example and section_name in gold_example:
             gold_json = json.dumps(gold_example[section_name], indent=2)
@@ -1558,7 +1347,7 @@ Generate the {section_name} section.""",
             ),
         ])
 
-        chain = section_prompt | LLM.with_structured_output(section_class)
+        chain = section_prompt | get_llm_handler().with_structured_output(section_class)
 
         max_retries = 3
         for attempt in range(max_retries):
@@ -1587,10 +1376,7 @@ Generate the {section_name} section.""",
                     )
                     raise
 
-    # =====================================================================
-    # PHASE 6: Assemble card
-    # =====================================================================
-    logger.debug("Assembling final benchmark card")
+    # Phase 6: Assemble card
 
     try:
         final_card = BenchmarkCard(
@@ -1613,19 +1399,13 @@ Generate the {section_name} section.""",
         if isinstance(benchmark_card_dict[section_key], dict):
             benchmark_card_dict[section_key].pop("provenance", None)
 
-    # =====================================================================
-    # PHASE 7: Deterministic overrides
-    # =====================================================================
+    # Phase 7: Deterministic overrides
     benchmark_card_dict = apply_deterministic_overrides(benchmark_card_dict, det_facts)
 
-    # =====================================================================
-    # PHASE 8: Post-processing
-    # =====================================================================
+    # Phase 8: Post-processing
     benchmark_card_dict = post_process_card(benchmark_card_dict)
 
-    # =====================================================================
-    # PHASE 9: Confidence
-    # =====================================================================
+    # Phase 9: Confidence
     confidence = compute_card_confidence(has_paper, has_hf_readme, has_eee, has_hf)
 
     return {
@@ -1642,7 +1422,7 @@ Generate the {section_name} section.""",
             "query": query,
             "composition_timestamp": datetime.now().isoformat(),
             "generation_method": "source_isolated_extraction",
-            "model_used": LLM.model_name,
+            "model_used": get_llm_handler().model_name,
             "confidence": confidence,
         },
     }

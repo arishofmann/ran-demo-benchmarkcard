@@ -6,106 +6,90 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
 
 class Config:
     """Configuration settings for the benchmark processing pipeline."""
 
-    # Path Configuration (using pathlib for better path handling)
-    # From config.py: src/benchmarkcard/config.py → 2x parent = project root
+    # src/auto_benchmarkcard/config.py -> project root is two levels up
     PROJECT_ROOT: Path = Path(__file__).parent.parent.parent
     EXTERNAL_DIR: Path = PROJECT_ROOT / "external"
     FACTREASONER_DIR: Path = EXTERNAL_DIR / "FactReasoner"
     MERLIN_BIN: Path = EXTERNAL_DIR / "merlin" / "bin" / "merlin"
 
-    # LLM Configuration — tiered models for different task complexities
-    COMPOSER_MODEL: str = os.getenv(
-        "RITS_COMPOSER_MODEL", "deepseek-ai/DeepSeek-V3.2"
-    )
-    LIGHT_MODEL: str = os.getenv(
-        "RITS_LIGHT_MODEL", "ibm-granite/granite-3.3-8b-instruct"
-    )
-    FACTREASONER_MODEL: str = "llama-3.3-70b-instruct"  # must match FactReasoner models.yaml key
-    DEFAULT_MODEL: str = FACTREASONER_MODEL  # backward compat
-    DEFAULT_EMBEDDING_MODEL: str = "bge-large"
-    LLM_ENGINE_TYPE: str = "rits"  # or ollama, vllm
+    # LLM engine and model tiers
+    LLM_ENGINE_TYPE: str = os.getenv("LLM_ENGINE_TYPE", "hf")
 
-    # Processing Configuration
+    COMPOSER_MODEL: str = (
+        os.getenv(f"{LLM_ENGINE_TYPE.upper()}_COMPOSER_MODEL")
+        or os.getenv("COMPOSER_MODEL")
+        or "deepseek-ai/DeepSeek-V3.2"
+    )
+    FACTREASONER_MODEL: str = os.getenv(
+        "FACTREASONER_MODEL", "llama-3.3-70b-instruct"
+    )
+    DEFAULT_EMBEDDING_MODEL: str = "bge-large"
+
+    # Processing
     DEFAULT_FACTUALITY_THRESHOLD: float = 0.8
     DEFAULT_TOP_K: int = 4
 
-    # Paper extraction budget (chars) — how much paper text to send to the LLM
-    # DeepSeek-V3 supports 128K tokens; 25K chars ≈ 6K tokens, leaves ample room
+    # Max chars of paper text sent to the LLM (25K chars ~ 6K tokens)
     PAPER_EXTRACTION_BUDGET: int = 25000
-    # Chars from start of paper always included (abstract + introduction)
     PAPER_INTRO_CHARS: int = 4000
 
-    # RAG Configuration
+    # RAG
     ENABLE_LLM_RERANKING: bool = True
     ENABLE_HYBRID_SEARCH: bool = True
     ENABLE_QUERY_EXPANSION: bool = True
 
-    # Chunking Configuration
+    # Chunking
     PARENT_CHUNK_SIZE: int = 2048
     CHILD_CHUNK_SIZE: int = 512
 
-    # Directory Configuration (string-based for backward compatibility)
     FACTREASONER_CACHE_DIR: str = "factreasoner_cache"
-    MERLIN_PATH: str = "external/merlin/bin/merlin"  # Deprecated: use MERLIN_BIN
 
-    # File Extensions
     JSON_EXTENSION: str = ".json"
     JSONL_EXTENSION: str = ".jsonl"
-
-    # Timestamp Format
     TIMESTAMP_FORMAT: str = "%Y-%m-%d_%H-%M"
 
-    # Output Directories
     TOOL_OUTPUT_DIR: str = "tool_output"
     BENCHMARK_CARD_DIR: str = "benchmarkcard"
     OUTPUT_DIR: str = "output"
 
     @classmethod
     def get_env_var(cls, key: str, default: Optional[str] = None) -> Optional[str]:
-        """Get environment variable with optional default.
-
-        Args:
-            key: Environment variable name.
-            default: Default value if variable is not set.
-
-        Returns:
-            Environment variable value or default.
-        """
+        """Get environment variable with optional default."""
         return os.getenv(key, default)
+
+    _ENGINE_REQUIRED_VARS: dict = {
+        "rits": ["RITS_API_KEY", "RITS_API_URL"],
+        "hf": ["HF_TOKEN"],
+        "ollama": ["OLLAMA_API_URL"],
+        "vllm": ["VLLM_API_URL"],
+        "wml": ["WML_API_URL"],
+    }
 
     @classmethod
     def validate_config(cls) -> None:
-        """Validate required configuration settings.
-
-        Raises:
-            ValueError: If required environment variables are missing.
-        """
-        required_env_vars = ["RITS_API_KEY", "RITS_MODEL", "RITS_API_URL"]
+        """Validate that required environment variables are set for the active engine."""
+        engine = cls.LLM_ENGINE_TYPE.lower()
+        required_env_vars = cls._ENGINE_REQUIRED_VARS.get(engine, [])
 
         missing_vars = [var for var in required_env_vars if not cls.get_env_var(var)]
         if missing_vars:
-            raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+            raise ValueError(
+                f"Missing required environment variables for engine '{engine}': "
+                f"{', '.join(missing_vars)}"
+            )
 
 
 _llm_cache: dict = {}
 
 
 def get_llm_handler(model_name: Optional[str] = None):
-    """Get or create a cached LLM handler for the given model.
-
-    Args:
-        model_name: Model identifier (defaults to COMPOSER_MODEL).
-
-    Returns:
-        LLMHandler: Initialized LLM handler for the requested model.
-    """
+    """Get or create a cached LLM handler for the given model."""
     import logging
 
     from auto_benchmarkcard.llm_handler import LLMHandler
@@ -127,32 +111,4 @@ def get_llm_handler(model_name: Optional[str] = None):
     return _llm_cache[key]
 
 
-def get_light_llm_handler():
-    """Get the lightweight model handler (for reranking, reformulation, atomization).
 
-    Falls back to the composer model if the light model endpoint is unreachable.
-    """
-    import logging
-
-    _log = logging.getLogger(__name__)
-    try:
-        return get_llm_handler(Config.LIGHT_MODEL)
-    except RuntimeError:
-        _log.warning(
-            "Light model %s unavailable, falling back to composer model",
-            Config.LIGHT_MODEL,
-        )
-        return get_llm_handler(Config.COMPOSER_MODEL)
-
-
-class _LazyLLM:
-    """Lazy proxy so importing config doesn't immediately connect to the LLM endpoint."""
-
-    def __getattr__(self, name):
-        global LLM
-        LLM = get_llm_handler()
-        return getattr(LLM, name)
-
-
-# Backward compatibility — default LLM is the composer (heavy) model, initialized lazily
-LLM = _LazyLLM()

@@ -245,7 +245,7 @@ class BenchmarkCardAtomizer:
         llm_handler: LLM handler instance for generation.
     """
 
-    def __init__(self, engine_type: str = "rits", model_name: str = None, **kwargs):
+    def __init__(self, engine_type: str = "hf", model_name: str = None, **kwargs):
         if LLMHandler is None:
             raise ImportError("LLM handler required for atomization")
 
@@ -339,7 +339,7 @@ def exclude_risk_sections(benchmark_card: Dict[str, Any]) -> Dict[str, Any]:
 def atomize_benchmark_card(
     benchmark_card: Dict[str, Any],
     field: str = "all",
-    engine_type: str = "rits",
+    engine_type: str = "hf",
     model_name: str = None,
 ) -> List[dict]:
     """Extract atomic statements from benchmark card.

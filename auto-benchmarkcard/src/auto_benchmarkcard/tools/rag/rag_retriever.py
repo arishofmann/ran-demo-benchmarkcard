@@ -735,9 +735,8 @@ Return as JSON array: ["query1", "query2", "query3", ...]"""
         # Reformulate statement into better search query
         search_query = self._reformulate_atom_for_search(statement)
 
-        # Show which atom we're processing
         atom_preview = statement[:80] + "..." if len(statement) > 80 else statement
-        logger.debug(f'🔄 Retrieving evidence for: "{atom_preview}"')
+        logger.debug(f'Retrieving evidence for: "{atom_preview}"')
 
         # Extract keywords from both original and reformulated queries
         keywords = self.extract_keywords(statement)
@@ -810,7 +809,7 @@ Return as JSON array: ["query1", "query2", "query3", ...]"""
 
         # Show summary of what we found
         sources = set(chunk.get("source", "unknown") for chunk in retrieved_chunks)
-        logger.debug(f"✅ Found {len(retrieved_chunks)} evidence chunks from {len(sources)} sources")
+        logger.debug(f"Found {len(retrieved_chunks)} evidence chunks from {len(sources)} sources")
         return retrieved_chunks
 
     def retrieve_for_statements_batch(self, statements: List[str]) -> List[List[Dict[str, Any]]]:
@@ -830,7 +829,7 @@ Return as JSON array: ["query1", "query2", "query3", ...]"""
         if not statements:
             return []
 
-        logger.debug(f"🔄 Processing {len(statements)} statements with batch reformulation")
+        logger.debug(f"Processing {len(statements)} statements with batch reformulation")
 
         # Batch reformulate all statements at once (single LLM call)
         reformulated_queries = self._reformulate_atoms_for_search_batch(statements)
@@ -840,7 +839,7 @@ Return as JSON array: ["query1", "query2", "query3", ...]"""
         for i, (statement, search_query) in enumerate(zip(statements, reformulated_queries)):
             # Show which atom we're processing
             atom_preview = statement[:80] + "..." if len(statement) > 80 else statement
-            logger.debug(f'🔄 [{i+1}/{len(statements)}] Processing: "{atom_preview}"')
+            logger.debug(f'[{i+1}/{len(statements)}] Processing: "{atom_preview}"')
 
             # Extract keywords from both original and reformulated queries
             keywords = self.extract_keywords(statement)
@@ -919,7 +918,7 @@ Return as JSON array: ["query1", "query2", "query3", ...]"""
 
         # Show final summary
         total_chunks = sum(len(result) for result in all_results)
-        logger.debug(f"✅ Batch processing complete: {total_chunks} total chunks retrieved")
+        logger.debug(f"Batch processing complete: {total_chunks} total chunks retrieved")
 
         return all_results
 
@@ -943,7 +942,7 @@ Return as JSON array: ["query1", "query2", "query3", ...]"""
         if not statements:
             return []
 
-        logger.debug(f"🚀 Processing {len(statements)} statements with parallel reranking")
+        logger.debug(f"Processing {len(statements)} statements with parallel reranking")
 
         # Batch reformulate all statements at once (single LLM call)
         reformulated_queries = self._reformulate_atoms_for_search_batch(statements)
@@ -952,7 +951,7 @@ Return as JSON array: ["query1", "query2", "query3", ...]"""
         statements_and_docs = []
         for i, (statement, search_query) in enumerate(zip(statements, reformulated_queries)):
             atom_preview = statement[:80] + "..." if len(statement) > 80 else statement
-            logger.debug(f'🔄 [{i+1}/{len(statements)}] Collecting docs for: "{atom_preview}"')
+            logger.debug(f'[{i+1}/{len(statements)}] Collecting docs for: "{atom_preview}"')
 
             # Extract keywords from both original and reformulated queries
             keywords = self.extract_keywords(statement)

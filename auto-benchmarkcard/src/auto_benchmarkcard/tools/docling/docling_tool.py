@@ -150,7 +150,7 @@ def extract_paper_with_docling(paper_url: str) -> Dict[str, Any]:
         filtered_text = _filter_literature_section(text_content)
 
         logger.debug(
-            f"✅ Successfully extracted paper: {len(text_content)} chars, {len(filtered_text)} chars after filtering"
+            f"Paper extracted: {len(text_content)} chars, {len(filtered_text)} chars after filtering"
         )
 
         # Create result

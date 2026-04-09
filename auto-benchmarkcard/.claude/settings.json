@@ -4,7 +4,31 @@
       "Bash(python3 -c \":*)",
       "Bash(python3 -m auto_benchmarkcard process-eee external/eee_samples --benchmarks \"IFEval\" --output output/quality_v4)",
       "Bash(python3:*)",
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "WebSearch",
+      "Read(//Users/aris/Desktop/singapur/risk_atlas_nexus/**)",
+      "Bash(pip show:*)",
+      "Bash(pip list:*)",
+      "Read(//Users/aris/Desktop/singapur/**)",
+      "Read(//Users/aris/Desktop/**)",
+      "Read(//Users/aris/**)",
+      "Bash(gh repo:*)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(find /Users/aris/Desktop/singapur -name *.py -type f)",
+      "Bash(find /Users/aris/Desktop/singapur -path */mellea/backends -type d)",
+      "Bash(pip3 show:*)",
+      "Bash(python -c \"from ai_atlas_nexus.blocks.inference import HFInferenceEngine; from ai_atlas_nexus.metadata_base import InferenceEngineType; print\\(''HF enum:'', InferenceEngineType.HF\\); print\\(''HFInferenceEngine imported OK''\\)\")",
+      "Bash(python -c \"from auto_benchmarkcard.llm_handler import LLMHandler; print\\(''LLMHandler imported OK''\\)\")",
+      "Bash(python -m auto_benchmarkcard --help)",
+      "Bash(python -m auto_benchmarkcard process-eee --help)",
+      "Bash(python -m auto_benchmarkcard process-eee ./external/eee_samples -o ./output/quality_v12 -v)",
+      "Bash(python -m auto_benchmarkcard process-eee ./external/eee_samples -o ./output/quality_v12 -b \"TruthfulQA,MMLU,BBH\" -v)",
+      "Bash(wc -l /Users/aris/Desktop/singapur/ai-atlas-nexus-demos/auto-benchmarkcard/src/auto_benchmarkcard/*.py)",
+      "Bash(grep -r \"TODO\\\\|FIXME\\\\|XXX\\\\|HACK\" /Users/aris/Desktop/singapur/ai-atlas-nexus-demos/auto-benchmarkcard/src --include=*.py)"
+    ],
+    "additionalDirectories": [
+      "/Users/aris/Desktop/singapur/FactReasoner/src/fact_reasoner",
+      "/Users/aris/Desktop/singapur/risk_atlas_nexus/src/ai_atlas_nexus"
     ]
   }
 }
